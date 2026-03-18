@@ -1,6 +1,6 @@
 """
-app.py — MRP Cajas de Alimentos Delivery
-Todos los widgets tienen key único para evitar StreamlitDuplicateElementId.
+app.py — MRP Cajas de Alimentos Delivery (v3)
+Incluye: Menús, Costeo por paquete, Perfil nutricional
 """
 import streamlit as st
 import pandas as pd
@@ -9,128 +9,115 @@ from database import init_db, get_connection
 from mrp_engine import (
     agregar_proveedor, agregar_ingrediente, agregar_receta,
     agregar_ingrediente_receta, agregar_caja, agregar_receta_a_caja,
+    agregar_menu, agregar_receta_a_menu,
     crear_pedido, calcular_requerimientos, generar_ordenes_compra,
-    actualizar_stock,
+    actualizar_stock, calcular_costo_menu, comparar_menus,
 )
 
 st.set_page_config(page_title="MRP — Cajas Delivery", page_icon="🥗", layout="wide")
 init_db()
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def Q(sql, p=()):
     with get_connection() as c:
         return [dict(r) for r in c.execute(sql, p).fetchall()]
 
-def get_proveedores():
-    return Q("SELECT id,nombre,contacto,telefono,email,lead_time FROM proveedores WHERE activo=1")
+def get_proveedores():  return Q("SELECT id,nombre,contacto,telefono,email,lead_time FROM proveedores WHERE activo=1")
+def get_ingredientes(): return Q("""SELECT i.*,COALESCE(p.nombre,'—') proveedor
+    FROM ingredientes i LEFT JOIN proveedores p ON p.id=i.proveedor_id""")
+def get_recetas():      return Q("SELECT * FROM recetas WHERE activa=1")
+def get_cajas():        return Q("SELECT * FROM cajas WHERE activa=1")
+def get_menus():        return Q("SELECT * FROM menus WHERE activo=1 ORDER BY categoria,racion")
+def get_bom(rid):       return Q("""SELECT ri.id,ri.cantidad,i.id ing_id,i.nombre,i.unidad,
+    i.costo_unitario,i.calorias,i.proteinas_g,i.vegetales,COALESCE(p.nombre,'—') proveedor
+    FROM receta_ingredientes ri JOIN ingredientes i ON i.id=ri.ingrediente_id
+    LEFT JOIN proveedores p ON p.id=i.proveedor_id WHERE ri.receta_id=?""", (rid,))
+def get_caja_recetas(cid): return Q("""SELECT cr.id,r.id rec_id,r.nombre FROM caja_recetas cr
+    JOIN recetas r ON r.id=cr.receta_id WHERE cr.caja_id=?""", (cid,))
+def get_menu_recetas(mid):  return Q("""SELECT mr.id,r.id rec_id,r.nombre FROM menu_recetas mr
+    JOIN recetas r ON r.id=mr.receta_id WHERE mr.menu_id=?""", (mid,))
+def get_pedidos():      return Q("""SELECT p.id,p.cliente,p.fecha_entrega,p.estado,
+    c.nombre caja,pd.cantidad,pd.porciones,pd.id pd_id
+    FROM pedidos p JOIN pedido_detalle pd ON pd.pedido_id=p.id
+    JOIN cajas c ON c.id=pd.caja_id ORDER BY p.fecha_entrega""")
 
-def get_ingredientes():
-    return Q("""SELECT i.*,COALESCE(p.nombre,'—') proveedor
-                FROM ingredientes i LEFT JOIN proveedores p ON p.id=i.proveedor_id""")
+TIPOS    = ["fresco","condimento","empaque","otro"]
+ESTADOS  = ["pendiente","en_proceso","completado","cancelado"]
+CATS     = ["economico","nivel_medio","alto_proteina","vegetariano","alto_vegetales"]
+CATS_LBL = {"economico":"💰 Económico","nivel_medio":"⭐ Nivel Medio",
+             "alto_proteina":"💪 Alto en Proteína","vegetariano":"🥦 Vegetariano",
+             "alto_vegetales":"🥗 Alto en Vegetales"}
+RACIONES = [2, 4, 6]
 
-def get_recetas():
-    return Q("SELECT * FROM recetas WHERE activa=1")
-
-def get_cajas():
-    return Q("SELECT * FROM cajas WHERE activa=1")
-
-def get_bom(rid):
-    return Q("""SELECT ri.id, ri.cantidad, i.id ing_id, i.nombre, i.unidad,
-                       i.costo_unitario, COALESCE(p.nombre,'—') proveedor
-                FROM receta_ingredientes ri
-                JOIN ingredientes i ON i.id=ri.ingrediente_id
-                LEFT JOIN proveedores p ON p.id=i.proveedor_id
-                WHERE ri.receta_id=?""", (rid,))
-
-def get_caja_recetas(cid):
-    return Q("""SELECT cr.id, r.id rec_id, r.nombre FROM caja_recetas cr
-                JOIN recetas r ON r.id=cr.receta_id WHERE cr.caja_id=?""", (cid,))
-
-def get_pedidos():
-    return Q("""SELECT p.id,p.cliente,p.fecha_entrega,p.estado,
-                       c.nombre caja,pd.cantidad,pd.porciones,pd.id pd_id
-                FROM pedidos p JOIN pedido_detalle pd ON pd.pedido_id=p.id
-                JOIN cajas c ON c.id=pd.caja_id
-                ORDER BY p.fecha_entrega""")
-
-st.markdown("""
-<style>
+# ── CSS ───────────────────────────────────────────────────────────────────────
+st.markdown("""<style>
 [data-testid="stSidebar"]{background:#0d1b2a}
 [data-testid="stSidebar"] *{color:#e8f5e9!important}
 .hdr{background:linear-gradient(120deg,#0d1b2a,#1b4332);color:#e8f5e9;
      padding:20px 28px;border-radius:12px;margin-bottom:20px}
-.hdr h1{margin:0;font-size:1.6rem}
-.hdr p{margin:4px 0 0;opacity:.65;font-size:.85rem}
-</style>
-""", unsafe_allow_html=True)
+.hdr h1{margin:0;font-size:1.6rem}.hdr p{margin:4px 0 0;opacity:.65;font-size:.85rem}
+.cost-card{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:16px 20px;margin-bottom:10px}
+.cost-title{font-size:1rem;font-weight:700;color:#166534;margin-bottom:8px}
+.nut-pill{display:inline-block;padding:3px 10px;border-radius:20px;font-size:.78rem;
+          font-weight:600;margin:2px}
+.pill-cal{background:#fef9c3;color:#854d0e}
+.pill-prot{background:#dbeafe;color:#1e40af}
+.pill-veg{background:#dcfce7;color:#166534}
+</style>""", unsafe_allow_html=True)
 
 st.markdown("""<div class='hdr'>
 <h1>🥗 MRP — Cajas de Alimentos Delivery</h1>
-<p>Gestión de recetas · ingredientes · proveedores · pedidos · planificación</p>
+<p>Gestión de recetas · menús · costeo de paquetes · MRP · planificación</p>
 </div>""", unsafe_allow_html=True)
 
 pagina = st.sidebar.radio("Navegación", [
     "📦 Proveedores","🥬 Ingredientes","📋 Recetas / BOM",
+    "🍽️ Menús","💰 Costeo de Paquetes",
     "📦 Cajas","📬 Pedidos","⚙️ MRP"])
-
-TIPOS = ["fresco","condimento","empaque","otro"]
-ESTADOS = ["pendiente","en_proceso","completado","cancelado"]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PROVEEDORES
 # ══════════════════════════════════════════════════════════════════════════════
 if pagina == "📦 Proveedores":
     st.subheader("📦 Proveedores")
-    tab_ver, tab_nuevo, tab_editar = st.tabs(["📄 Ver todos","➕ Nuevo","✏️ Editar / Eliminar"])
+    tab_ver,tab_nuevo,tab_editar = st.tabs(["📄 Ver todos","➕ Nuevo","✏️ Editar / Eliminar"])
 
     with tab_nuevo:
-        c1,c2,c3 = st.columns(3)
-        pn = c1.text_input("Nombre *",            key="prov_new_nombre")
-        pc = c2.text_input("Contacto",            key="prov_new_contacto")
-        pt = c3.text_input("Teléfono",            key="prov_new_telefono")
-        c4,c5 = st.columns(2)
-        pe = c4.text_input("Email",               key="prov_new_email")
-        pl = c5.number_input("Lead time (días)", min_value=1, max_value=60, value=2, key="prov_new_lead")
-        if st.button("💾 Guardar proveedor", type="primary", key="btn_prov_guardar"):
-            if not pn.strip():
-                st.error("Nombre obligatorio.")
+        c1,c2,c3=st.columns(3)
+        pn=c1.text_input("Nombre *",key="pn"); pc=c2.text_input("Contacto",key="pc"); pt=c3.text_input("Teléfono",key="pt")
+        c4,c5=st.columns(2)
+        pe=c4.text_input("Email",key="pe"); pl=c5.number_input("Lead time (días)",min_value=1,max_value=60,value=2,key="pl")
+        if st.button("💾 Guardar proveedor",type="primary",key="btn_pnew"):
+            if not pn.strip(): st.error("Nombre obligatorio.")
             else:
                 agregar_proveedor(pn.strip(),pc.strip(),pt.strip(),pe.strip(),int(pl))
                 st.success(f"✅ **{pn}** guardado."); st.rerun()
 
     with tab_ver:
-        rows = get_proveedores()
+        rows=get_proveedores()
         if rows:
-            df = pd.DataFrame(rows)
-            df.columns = ["#","Nombre","Contacto","Teléfono","Email","Lead time (días)"]
-            st.dataframe(df, use_container_width=True, hide_index=True)
-        else:
-            st.info("Sin proveedores aún.")
+            df=pd.DataFrame(rows); df.columns=["#","Nombre","Contacto","Teléfono","Email","Lead time"]
+            st.dataframe(df,use_container_width=True,hide_index=True)
+        else: st.info("Sin proveedores.")
 
     with tab_editar:
-        rows = get_proveedores()
-        if not rows:
-            st.info("Sin proveedores.")
-        else:
-            opts = {p["nombre"]: p for p in rows}
-            sel  = st.selectbox("Selecciona proveedor", list(opts.keys()), key="prov_edit_sel")
-            pv   = opts[sel]
-            st.markdown("---")
-            c1,c2,c3 = st.columns(3)
-            en = c1.text_input("Nombre",   value=pv["nombre"],   key="prov_edit_nombre")
-            ec = c2.text_input("Contacto", value=pv["contacto"], key="prov_edit_contacto")
-            et = c3.text_input("Teléfono", value=pv["telefono"], key="prov_edit_telefono")
-            c4,c5 = st.columns(2)
-            ee = c4.text_input("Email",    value=pv["email"],    key="prov_edit_email")
-            el = c5.number_input("Lead time", min_value=1, max_value=60, value=int(pv["lead_time"]), key="prov_edit_lead")
-            col1,col2 = st.columns(2)
-            if col1.button("💾 Guardar cambios", type="primary", key="btn_prov_update"):
+        rows=get_proveedores()
+        if rows:
+            opts={p["nombre"]:p for p in rows}
+            sel=st.selectbox("Proveedor",list(opts.keys()),key="pedit_sel"); pv=opts[sel]
+            c1,c2,c3=st.columns(3)
+            en=c1.text_input("Nombre",value=pv["nombre"],key="pe_n"); ec=c2.text_input("Contacto",value=pv["contacto"],key="pe_c"); et=c3.text_input("Teléfono",value=pv["telefono"],key="pe_t")
+            c4,c5=st.columns(2)
+            ee=c4.text_input("Email",value=pv["email"],key="pe_e"); el=c5.number_input("Lead time",min_value=1,max_value=60,value=int(pv["lead_time"]),key="pe_l")
+            col1,col2=st.columns(2)
+            if col1.button("💾 Guardar",type="primary",key="btn_pupd"):
                 with get_connection() as conn:
                     conn.execute("UPDATE proveedores SET nombre=?,contacto=?,telefono=?,email=?,lead_time=? WHERE id=?",
                                  (en.strip(),ec.strip(),et.strip(),ee.strip(),int(el),pv["id"]))
-                st.success(f"✅ **{en}** actualizado."); st.rerun()
-            if col2.button("🗑 Eliminar", type="secondary", key="btn_prov_delete"):
+                st.success("✅ Actualizado."); st.rerun()
+            if col2.button("🗑 Eliminar",type="secondary",key="btn_pdel"):
                 with get_connection() as conn:
-                    conn.execute("UPDATE proveedores SET activo=0 WHERE id=?", (pv["id"],))
+                    conn.execute("UPDATE proveedores SET activo=0 WHERE id=?",(pv["id"],))
                 st.warning(f"🗑 **{pv['nombre']}** eliminado."); st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -138,83 +125,86 @@ if pagina == "📦 Proveedores":
 # ══════════════════════════════════════════════════════════════════════════════
 elif pagina == "🥬 Ingredientes":
     st.subheader("🥬 Ingredientes")
-    provs      = get_proveedores()
-    prov_opts  = {p["nombre"]: p["id"] for p in provs}
-    prov_lista = ["— Sin proveedor —"] + list(prov_opts.keys())
-
-    tab_ver,tab_nuevo,tab_editar,tab_stock = st.tabs(["📄 Ver todos","➕ Nuevo","✏️ Editar","📦 Stock"])
+    provs=get_proveedores(); prov_opts={p["nombre"]:p["id"] for p in provs}
+    prov_lista=["— Sin proveedor —"]+list(prov_opts.keys())
+    tab_ver,tab_nuevo,tab_editar,tab_stock=st.tabs(["📄 Ver todos","➕ Nuevo","✏️ Editar","📦 Stock"])
 
     with tab_ver:
-        rows = get_ingredientes()
+        rows=get_ingredientes()
         if rows:
-            df = pd.DataFrame(rows)[["id","nombre","tipo","unidad","stock_actual","stock_minimo","costo_unitario","proveedor"]]
-            df.columns = ["#","Nombre","Tipo","Unidad","Stock actual","Stock mínimo","Costo Q","Proveedor"]
-            def cs(row): return ["background-color:#fee2e2"]*len(row) if row["Stock actual"]<=row["Stock mínimo"] else [""]*len(row)
-            st.dataframe(df.style.apply(cs,axis=1), use_container_width=True, hide_index=True)
-            st.caption("🔴 Rojo = stock igual o bajo el mínimo")
-        else:
-            st.info("Sin ingredientes.")
+            df=pd.DataFrame(rows)[["id","nombre","tipo","unidad","stock_actual","stock_minimo","costo_unitario","proteinas_g","vegetales","proveedor"]]
+            df.columns=["#","Nombre","Tipo","Unidad","Stock","Mínimo","Costo Q","Proteínas g","¿Vegetal?","Proveedor"]
+            df["¿Vegetal?"]=df["¿Vegetal?"].apply(lambda x:"🥦 Sí" if x else "No")
+            def cs(row): return ["background-color:#fee2e2"]*len(row) if row["Stock"]<=row["Mínimo"] else [""]*len(row)
+            st.dataframe(df.style.apply(cs,axis=1),use_container_width=True,hide_index=True)
+            st.caption("🔴 Rojo = stock bajo mínimo")
+        else: st.info("Sin ingredientes.")
 
     with tab_nuevo:
-        c1,c2,c3 = st.columns(3)
-        i_n  = c1.text_input("Nombre *",  key="ing_new_nombre")
-        i_t  = c2.selectbox("Tipo",       TIPOS, key="ing_new_tipo")
-        i_u  = c3.text_input("Unidad",    key="ing_new_unidad")
-        c4,c5,c6,c7 = st.columns(4)
-        i_st = c4.number_input("Stock actual",  min_value=0.0, step=0.1, key="ing_new_stock")
-        i_sm = c5.number_input("Stock mínimo",  min_value=0.0, step=0.1, key="ing_new_stockmin")
-        i_co = c6.number_input("Costo Q",       min_value=0.0, step=0.5, key="ing_new_costo")
-        i_pv = c7.selectbox("Proveedor",  prov_lista, key="ing_new_prov")
-        if st.button("💾 Guardar ingrediente", type="primary", key="btn_ing_guardar"):
-            if not i_n.strip():
-                st.error("Nombre obligatorio.")
+        st.markdown("**Datos básicos**")
+        c1,c2,c3=st.columns(3)
+        i_n=c1.text_input("Nombre *",key="in_n"); i_t=c2.selectbox("Tipo",TIPOS,key="in_t"); i_u=c3.text_input("Unidad",key="in_u")
+        c4,c5,c6,c7=st.columns(4)
+        i_st=c4.number_input("Stock actual",min_value=0.0,step=0.1,key="in_st")
+        i_sm=c5.number_input("Stock mínimo",min_value=0.0,step=0.1,key="in_sm")
+        i_co=c6.number_input("Costo Q",min_value=0.0,step=0.5,key="in_co")
+        i_pv=c7.selectbox("Proveedor",prov_lista,key="in_pv")
+        st.markdown("**Info nutricional** *(por unidad del ingrediente)*")
+        c1,c2,c3=st.columns(3)
+        i_cal=c1.number_input("Calorías",min_value=0.0,step=1.0,key="in_cal")
+        i_pro=c2.number_input("Proteínas (g)",min_value=0.0,step=0.1,key="in_pro")
+        i_veg=c3.checkbox("¿Es vegetal?",key="in_veg")
+        if st.button("💾 Guardar ingrediente",type="primary",key="btn_inew"):
+            if not i_n.strip(): st.error("Nombre obligatorio.")
             else:
-                agregar_ingrediente(i_n.strip(),i_t,i_u.strip(),i_st,i_sm,i_co,prov_opts.get(i_pv))
+                agregar_ingrediente(i_n.strip(),i_t,i_u.strip(),i_st,i_sm,i_co,
+                                    prov_opts.get(i_pv),i_cal,i_pro,1 if i_veg else 0)
                 st.success(f"✅ **{i_n}** guardado."); st.rerun()
 
     with tab_editar:
-        rows = get_ingredientes()
-        if not rows:
-            st.info("Sin ingredientes.")
-        else:
-            ing_opts = {f"{i['nombre']} ({i['unidad']})": i for i in rows}
-            sel  = st.selectbox("Selecciona ingrediente", list(ing_opts.keys()), key="ing_edit_sel")
-            ing  = ing_opts[sel]
-            st.markdown("---")
-            c1,c2,c3 = st.columns(3)
-            en  = c1.text_input("Nombre", value=ing["nombre"], key="ing_edit_nombre")
-            et  = c2.selectbox("Tipo", TIPOS, index=TIPOS.index(ing["tipo"]), key="ing_edit_tipo")
-            eu  = c3.text_input("Unidad", value=ing["unidad"], key="ing_edit_unidad")
-            c4,c5,c6 = st.columns(3)
-            esm = c4.number_input("Stock mínimo",  min_value=0.0, step=0.1, value=float(ing["stock_minimo"]),    key="ing_edit_stockmin")
-            eco = c5.number_input("Costo Q",       min_value=0.0, step=0.5, value=float(ing["costo_unitario"]), key="ing_edit_costo")
-            pv_actual = ing["proveedor"] if ing["proveedor"] in prov_opts else "— Sin proveedor —"
-            epv = c6.selectbox("Proveedor", prov_lista, index=prov_lista.index(pv_actual) if pv_actual in prov_lista else 0, key="ing_edit_prov")
-            col1,col2 = st.columns(2)
-            if col1.button("💾 Guardar cambios", type="primary", key="btn_ing_update"):
+        rows=get_ingredientes()
+        if rows:
+            ing_opts={f"{i['nombre']} ({i['unidad']})":i for i in rows}
+            sel=st.selectbox("Ingrediente",list(ing_opts.keys()),key="iedit_sel"); ing=ing_opts[sel]
+            st.markdown("**Datos básicos**")
+            c1,c2,c3=st.columns(3)
+            en=c1.text_input("Nombre",value=ing["nombre"],key="ie_n")
+            et=c2.selectbox("Tipo",TIPOS,index=TIPOS.index(ing["tipo"]),key="ie_t")
+            eu=c3.text_input("Unidad",value=ing["unidad"],key="ie_u")
+            c4,c5,c6=st.columns(3)
+            esm=c4.number_input("Stock mínimo",min_value=0.0,step=0.1,value=float(ing["stock_minimo"]),key="ie_sm")
+            eco=c5.number_input("Costo Q",min_value=0.0,step=0.5,value=float(ing["costo_unitario"]),key="ie_co")
+            pv_act=ing["proveedor"] if ing["proveedor"] in prov_opts else "— Sin proveedor —"
+            epv=c6.selectbox("Proveedor",prov_lista,index=prov_lista.index(pv_act) if pv_act in prov_lista else 0,key="ie_pv")
+            st.markdown("**Info nutricional**")
+            c1,c2,c3=st.columns(3)
+            ecal=c1.number_input("Calorías",min_value=0.0,step=1.0,value=float(ing["calorias"]),key="ie_cal")
+            epro=c2.number_input("Proteínas (g)",min_value=0.0,step=0.1,value=float(ing["proteinas_g"]),key="ie_pro")
+            eveg=c3.checkbox("¿Es vegetal?",value=bool(ing["vegetales"]),key="ie_veg")
+            col1,col2=st.columns(2)
+            if col1.button("💾 Guardar cambios",type="primary",key="btn_iupd"):
                 with get_connection() as conn:
-                    conn.execute("UPDATE ingredientes SET nombre=?,tipo=?,unidad=?,stock_minimo=?,costo_unitario=?,proveedor_id=? WHERE id=?",
-                                 (en.strip(),et,eu.strip(),esm,eco,prov_opts.get(epv),ing["id"]))
-                st.success(f"✅ **{en}** actualizado."); st.rerun()
-            if col2.button("🗑 Eliminar ingrediente", type="secondary", key="btn_ing_delete"):
+                    conn.execute("UPDATE ingredientes SET nombre=?,tipo=?,unidad=?,stock_minimo=?,costo_unitario=?,proveedor_id=?,calorias=?,proteinas_g=?,vegetales=? WHERE id=?",
+                                 (en.strip(),et,eu.strip(),esm,eco,prov_opts.get(epv),ecal,epro,1 if eveg else 0,ing["id"]))
+                st.success("✅ Actualizado."); st.rerun()
+            if col2.button("🗑 Eliminar",type="secondary",key="btn_idel"):
                 with get_connection() as conn:
-                    conn.execute("DELETE FROM receta_ingredientes WHERE ingrediente_id=?", (ing["id"],))
-                    conn.execute("DELETE FROM ingredientes WHERE id=?", (ing["id"],))
+                    conn.execute("DELETE FROM receta_ingredientes WHERE ingrediente_id=?",(ing["id"],))
+                    conn.execute("DELETE FROM ingredientes WHERE id=?",(ing["id"],))
                 st.warning(f"🗑 **{ing['nombre']}** eliminado."); st.rerun()
 
     with tab_stock:
-        rows = get_ingredientes()
+        rows=get_ingredientes()
         if rows:
-            ing_opts2 = {f"{i['nombre']} ({i['unidad']})": i for i in rows}
-            sel2  = st.selectbox("Ingrediente", list(ing_opts2.keys()), key="stock_sel")
-            ing2  = ing_opts2[sel2]
+            io2={f"{i['nombre']} ({i['unidad']})":i for i in rows}
+            sel2=st.selectbox("Ingrediente",list(io2.keys()),key="stk_sel"); ing2=io2[sel2]
             st.info(f"Stock actual: **{ing2['stock_actual']} {ing2['unidad']}**")
-            c1,c2 = st.columns(2)
-            mov_t = c1.radio("Movimiento", ["📥 Entrada","📤 Salida","🔧 Ajuste"], key="stock_radio")
-            mov_c = c2.number_input("Cantidad", min_value=0.0, step=0.1, value=1.0, key="stock_cant")
-            if st.button("💾 Registrar movimiento", type="primary", key="btn_stock_reg"):
-                tipo_map = {"📥 Entrada":"entrada","📤 Salida":"salida","🔧 Ajuste":"ajuste"}
-                nuevo = actualizar_stock(ing2["id"], mov_c, tipo_map[mov_t])
+            c1,c2=st.columns(2)
+            mt=c1.radio("Movimiento",["📥 Entrada","📤 Salida","🔧 Ajuste"],key="stk_radio")
+            mc=c2.number_input("Cantidad",min_value=0.0,step=0.1,value=1.0,key="stk_cant")
+            if st.button("💾 Registrar",type="primary",key="btn_stk"):
+                tm={"📥 Entrada":"entrada","📤 Salida":"salida","🔧 Ajuste":"ajuste"}
+                nuevo=actualizar_stock(ing2["id"],mc,tm[mt])
                 st.success(f"✅ Nuevo stock: **{nuevo} {ing2['unidad']}**"); st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -222,189 +212,357 @@ elif pagina == "🥬 Ingredientes":
 # ══════════════════════════════════════════════════════════════════════════════
 elif pagina == "📋 Recetas / BOM":
     st.subheader("📋 Recetas / BOM")
-    tab_ver,tab_nuevo,tab_editar,tab_bom = st.tabs(["📄 Ver todas","➕ Nueva","✏️ Editar receta","🧾 Editar BOM"])
+    tab_ver,tab_nuevo,tab_editar,tab_bom=st.tabs(["📄 Ver todas","➕ Nueva","✏️ Editar","🧾 Editar BOM"])
 
     with tab_nuevo:
-        c1,c2 = st.columns(2)
-        rn = c1.text_input("Nombre *",     key="rec_new_nombre")
-        rd = c2.text_input("Descripción",  key="rec_new_desc")
-        if st.button("💾 Crear receta", type="primary", key="btn_rec_crear"):
-            if not rn.strip():
-                st.error("Nombre obligatorio.")
+        c1,c2=st.columns(2)
+        rn=c1.text_input("Nombre *",key="rec_n"); rd=c2.text_input("Descripción",key="rec_d")
+        if st.button("💾 Crear receta",type="primary",key="btn_rnew"):
+            if not rn.strip(): st.error("Nombre obligatorio.")
             else:
-                agregar_receta(rn.strip(), rd.strip())
+                agregar_receta(rn.strip(),rd.strip())
                 st.success(f"✅ **{rn}** creada."); st.rerun()
 
     with tab_ver:
-        recetas = get_recetas()
+        recetas=get_recetas()
         if recetas:
             for r in recetas:
-                bom   = get_bom(r["id"])
-                costo = sum(b["cantidad"]*b["costo_unitario"] for b in bom)
+                bom=get_bom(r["id"])
+                costo=sum(b["cantidad"]*b["costo_unitario"] for b in bom)
+                cal=sum(b["cantidad"]*b["calorias"] for b in bom)
+                prot=sum(b["cantidad"]*b["proteinas_g"] for b in bom)
+                veg=sum(1 for b in bom if b["vegetales"])
                 with st.expander(f"**{r['nombre']}** — {len(bom)} ingredientes | Q {costo:.2f}/porción"):
-                    st.write(f"*{r['descripcion']}*")
+                    col1,col2,col3=st.columns(3)
+                    col1.metric("Costo/porción",f"Q {costo:.2f}")
+                    col2.metric("Proteínas",f"{prot:.1f} g")
+                    col3.metric("Ingredientes vegetales",veg)
                     if bom:
-                        df = pd.DataFrame(bom)[["nombre","cantidad","unidad","costo_unitario","proveedor"]]
-                        df.columns = ["Ingrediente","Cantidad/porción","Unidad","Costo unit.","Proveedor"]
-                        st.dataframe(df, use_container_width=True, hide_index=True)
-                    else:
-                        st.warning("Sin ingredientes.")
-        else:
-            st.info("Sin recetas.")
+                        df=pd.DataFrame(bom)[["nombre","cantidad","unidad","costo_unitario","proteinas_g","vegetales","proveedor"]]
+                        df.columns=["Ingrediente","Cant./porción","Unidad","Costo Q","Proteínas g","Vegetal","Proveedor"]
+                        df["Vegetal"]=df["Vegetal"].apply(lambda x:"🥦" if x else "")
+                        st.dataframe(df,use_container_width=True,hide_index=True)
+        else: st.info("Sin recetas.")
 
     with tab_editar:
-        recetas = get_recetas()
-        if not recetas:
-            st.info("Sin recetas.")
-        else:
-            rec_opts = {r["nombre"]: r for r in recetas}
-            sel = st.selectbox("Selecciona receta", list(rec_opts.keys()), key="rec_edit_sel")
-            rec = rec_opts[sel]
-            st.markdown("---")
-            c1,c2 = st.columns(2)
-            en = c1.text_input("Nombre",      value=rec["nombre"],      key="rec_edit_nombre")
-            ed = c2.text_input("Descripción", value=rec["descripcion"], key="rec_edit_desc")
-            col1,col2 = st.columns(2)
-            if col1.button("💾 Guardar cambios", type="primary", key="btn_rec_update"):
+        recetas=get_recetas()
+        if recetas:
+            ro={r["nombre"]:r for r in recetas}
+            sel=st.selectbox("Receta",list(ro.keys()),key="redit_sel"); rec=ro[sel]
+            c1,c2=st.columns(2)
+            en=c1.text_input("Nombre",value=rec["nombre"],key="re_n"); ed=c2.text_input("Descripción",value=rec["descripcion"],key="re_d")
+            col1,col2=st.columns(2)
+            if col1.button("💾 Guardar",type="primary",key="btn_rupd"):
                 with get_connection() as conn:
-                    conn.execute("UPDATE recetas SET nombre=?,descripcion=? WHERE id=?",
-                                 (en.strip(),ed.strip(),rec["id"]))
-                st.success(f"✅ **{en}** actualizado."); st.rerun()
-            if col2.button("🗑 Eliminar receta", type="secondary", key="btn_rec_delete"):
+                    conn.execute("UPDATE recetas SET nombre=?,descripcion=? WHERE id=?",(en.strip(),ed.strip(),rec["id"]))
+                st.success("✅ Actualizado."); st.rerun()
+            if col2.button("🗑 Eliminar",type="secondary",key="btn_rdel"):
                 with get_connection() as conn:
-                    conn.execute("DELETE FROM receta_ingredientes WHERE receta_id=?", (rec["id"],))
-                    conn.execute("DELETE FROM caja_recetas WHERE receta_id=?", (rec["id"],))
-                    conn.execute("UPDATE recetas SET activa=0 WHERE id=?", (rec["id"],))
+                    conn.execute("DELETE FROM receta_ingredientes WHERE receta_id=?",(rec["id"],))
+                    conn.execute("DELETE FROM caja_recetas WHERE receta_id=?",(rec["id"],))
+                    conn.execute("DELETE FROM menu_recetas WHERE receta_id=?",(rec["id"],))
+                    conn.execute("UPDATE recetas SET activa=0 WHERE id=?",(rec["id"],))
                 st.warning(f"🗑 **{rec['nombre']}** eliminada."); st.rerun()
 
     with tab_bom:
-        recetas = get_recetas()
-        ings    = get_ingredientes()
-        if not recetas:
-            st.warning("Primero crea una receta.")
-        elif not ings:
-            st.warning("Primero agrega ingredientes.")
+        recetas=get_recetas(); ings=get_ingredientes()
+        if not recetas: st.warning("Primero crea una receta.")
+        elif not ings:  st.warning("Primero agrega ingredientes.")
         else:
-            rec_opts = {r["nombre"]: r["id"] for r in recetas}
-            ing_opts = {f"{i['nombre']} ({i['unidad']})": i["id"] for i in ings}
-            sel_rec  = st.selectbox("Receta", list(rec_opts.keys()), key="bom_rec_sel")
-            rid      = rec_opts[sel_rec]
-            bom      = get_bom(rid)
-
+            ro={r["nombre"]:r["id"] for r in recetas}
+            io={f"{i['nombre']} ({i['unidad']})":i["id"] for i in ings}
+            sel_r=st.selectbox("Receta",list(ro.keys()),key="bom_rsel"); rid=ro[sel_r]
+            bom=get_bom(rid)
             if bom:
-                st.markdown("**Ingredientes actuales:**")
                 for b in bom:
-                    col1,col2,col3 = st.columns([3,2,1])
+                    col1,col2,col3=st.columns([3,2,1])
                     col1.write(f"**{b['nombre']}** ({b['unidad']}) — {b['proveedor']}")
-                    nueva_cant = col2.number_input("Cant.", min_value=0.0, step=0.1,
-                                                   value=float(b["cantidad"]), key=f"bom_c_{b['id']}")
-                    if col2.button("💾", key=f"bom_s_{b['id']}"):
+                    nc=col2.number_input("Cant.",min_value=0.0,step=0.1,value=float(b["cantidad"]),key=f"bc_{b['id']}")
+                    if col2.button("💾",key=f"bs_{b['id']}"):
                         with get_connection() as conn:
-                            conn.execute("UPDATE receta_ingredientes SET cantidad=? WHERE id=?",
-                                         (nueva_cant, b["id"]))
-                        st.success("✅ Actualizado."); st.rerun()
-                    if col3.button("🗑", key=f"bom_d_{b['id']}"):
+                            conn.execute("UPDATE receta_ingredientes SET cantidad=? WHERE id=?",(nc,b["id"]))
+                        st.success("✅"); st.rerun()
+                    if col3.button("🗑",key=f"bd_{b['id']}"):
                         with get_connection() as conn:
-                            conn.execute("DELETE FROM receta_ingredientes WHERE id=?", (b["id"],))
-                        st.warning("🗑 Eliminado."); st.rerun()
-            else:
-                st.info("Sin ingredientes en esta receta.")
-
+                            conn.execute("DELETE FROM receta_ingredientes WHERE id=?",(b["id"],))
+                        st.rerun()
+            else: st.info("Sin ingredientes.")
             st.markdown("---")
-            st.markdown("**Agregar ingrediente:**")
-            c1,c2 = st.columns(2)
-            sel_ing  = c1.selectbox("Ingrediente", list(ing_opts.keys()), key="bom_ing_sel")
-            cantidad = c2.number_input("Cantidad por porción", min_value=0.0, step=0.1, value=1.0, key="bom_cant")
-            if st.button("➕ Agregar al BOM", type="primary", key="btn_bom_add"):
-                agregar_ingrediente_receta(rid, ing_opts[sel_ing], cantidad)
-                st.success("✅ Ingrediente agregado."); st.rerun()
+            c1,c2=st.columns(2)
+            si=c1.selectbox("Agregar ingrediente",list(io.keys()),key="bom_isel")
+            cant=c2.number_input("Cantidad/porción",min_value=0.0,step=0.1,value=1.0,key="bom_cant")
+            if st.button("➕ Agregar al BOM",type="primary",key="btn_badd"):
+                agregar_ingrediente_receta(rid,io[si],cant)
+                st.success("✅ Agregado."); st.rerun()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MENÚS
+# ══════════════════════════════════════════════════════════════════════════════
+elif pagina == "🍽️ Menús":
+    st.subheader("🍽️ Menús")
+    tab_ver,tab_nuevo,tab_editar,tab_recetas=st.tabs(["📄 Ver menús","➕ Nuevo menú","✏️ Editar","🔗 Recetas del menú"])
+
+    with tab_nuevo:
+        st.caption("Un menú es una combinación de recetas con una categoría y tamaño de ración.")
+        c1,c2=st.columns(2)
+        mn=c1.text_input("Nombre *",key="mn_n"); md=c2.text_input("Descripción",key="mn_d")
+        c3,c4=st.columns(2)
+        mc=c3.selectbox("Categoría",[CATS_LBL[k] for k in CATS],key="mn_cat")
+        mr=c4.selectbox("Ración (personas)",[2,4,6],key="mn_rac")
+        if st.button("💾 Crear menú",type="primary",key="btn_mnew"):
+            if not mn.strip(): st.error("Nombre obligatorio.")
+            else:
+                cat_key=CATS[[CATS_LBL[k] for k in CATS].index(mc)]
+                agregar_menu(mn.strip(),md.strip(),cat_key,mr)
+                st.success(f"✅ Menú **{mn}** creado."); st.rerun()
+
+    with tab_ver:
+        menus=get_menus()
+        if menus:
+            for m in menus:
+                recs=get_menu_recetas(m["id"])
+                with st.expander(f"**{m['nombre']}** — {CATS_LBL[m['categoria']]} | 👥 {m['racion']} personas | {len(recs)} recetas"):
+                    st.write(f"*{m['descripcion']}*")
+                    if recs:
+                        for r in recs: st.write(f"  • {r['nombre']}")
+                    else: st.warning("Sin recetas asignadas.")
+        else: st.info("Sin menús creados.")
+
+    with tab_editar:
+        menus=get_menus()
+        if not menus: st.info("Sin menús.")
+        else:
+            mo={m["nombre"]:m for m in menus}
+            sel=st.selectbox("Menú",list(mo.keys()),key="medit_sel"); m=mo[sel]
+            c1,c2=st.columns(2)
+            en=c1.text_input("Nombre",value=m["nombre"],key="me_n"); ed=c2.text_input("Descripción",value=m["descripcion"],key="me_d")
+            c3,c4=st.columns(2)
+            cat_lbls=[CATS_LBL[k] for k in CATS]
+            ec=c3.selectbox("Categoría",cat_lbls,index=CATS.index(m["categoria"]),key="me_cat")
+            er=c4.selectbox("Ración",[2,4,6],index=[2,4,6].index(m["racion"]),key="me_rac")
+            col1,col2=st.columns(2)
+            if col1.button("💾 Guardar",type="primary",key="btn_mupd"):
+                cat_key=CATS[cat_lbls.index(ec)]
+                with get_connection() as conn:
+                    conn.execute("UPDATE menus SET nombre=?,descripcion=?,categoria=?,racion=? WHERE id=?",
+                                 (en.strip(),ed.strip(),cat_key,er,m["id"]))
+                st.success("✅ Actualizado."); st.rerun()
+            if col2.button("🗑 Eliminar",type="secondary",key="btn_mdel"):
+                with get_connection() as conn:
+                    conn.execute("DELETE FROM menu_recetas WHERE menu_id=?",(m["id"],))
+                    conn.execute("UPDATE menus SET activo=0 WHERE id=?",(m["id"],))
+                st.warning(f"🗑 Menú eliminado."); st.rerun()
+
+    with tab_recetas:
+        menus=get_menus(); recetas=get_recetas()
+        if not menus: st.warning("Primero crea un menú.")
+        elif not recetas: st.warning("Primero crea recetas.")
+        else:
+            mo={m["nombre"]:m["id"] for m in menus}
+            ro={r["nombre"]:r["id"] for r in recetas}
+            sel_m=st.selectbox("Menú",list(mo.keys()),key="mrec_msel"); mid=mo[sel_m]
+            actuales=get_menu_recetas(mid)
+            if actuales:
+                st.markdown("**Recetas actuales:**")
+                for r in actuales:
+                    col1,col2=st.columns([4,1])
+                    col1.write(f"• {r['nombre']}")
+                    if col2.button("🗑",key=f"dmr_{r['id']}"):
+                        with get_connection() as conn:
+                            conn.execute("DELETE FROM menu_recetas WHERE id=?",(r["id"],))
+                        st.rerun()
+            else: st.info("Sin recetas.")
+            st.markdown("---")
+            sel_r=st.selectbox("Receta a agregar",list(ro.keys()),key="mrec_rsel")
+            if st.button("➕ Agregar receta al menú",type="primary",key="btn_mradd"):
+                agregar_receta_a_menu(mid,ro[sel_r])
+                st.success("✅ Receta agregada."); st.rerun()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COSTEO DE PAQUETES
+# ══════════════════════════════════════════════════════════════════════════════
+elif pagina == "💰 Costeo de Paquetes":
+    st.subheader("💰 Costeo de Paquetes")
+    menus=get_menus()
+
+    if not menus:
+        st.warning("Primero crea menús con recetas asignadas.")
+    else:
+        tab_individual,tab_comparar=st.tabs(["📊 Costeo individual","🔍 Comparar menús"])
+
+        with tab_individual:
+            mo={f"{m['nombre']} — {CATS_LBL[m['categoria']]} | {m['racion']} personas":m["id"] for m in menus}
+            sel=st.selectbox("Selecciona un menú",list(mo.keys()),key="cost_sel")
+            c1,c2=st.columns(2)
+            margen=c1.slider("Margen de ganancia %",10,80,35,key="cost_margen")
+            empaque=c2.number_input("Costo de empaque Q",min_value=0.0,step=0.5,value=5.0,key="cost_emp")
+
+            if st.button("📊 Calcular costo",type="primary",key="btn_cost"):
+                res=calcular_costo_menu(mo[sel],margen,empaque)
+                if not res:
+                    st.error("No se pudo calcular.")
+                else:
+                    m=res["menu"]
+                    st.markdown(f"### {m['nombre']} — {CATS_LBL[m['categoria']]} | 👥 {res['racion']} personas")
+
+                    # Métricas principales
+                    col1,col2,col3,col4=st.columns(4)
+                    col1.metric("Costo ingredientes", f"Q {res['costo_ingredientes']:.2f}")
+                    col2.metric("Costo empaque",       f"Q {res['costo_empaque']:.2f}")
+                    col3.metric("Costo total",         f"Q {res['costo_total']:.2f}")
+                    col4.metric("💰 Precio sugerido",  f"Q {res['precio_sugerido']:.2f}",
+                                delta=f"+Q {res['ganancia']:.2f} ganancia")
+
+                    col1,col2,col3=st.columns(3)
+                    col1.metric("Costo por persona",   f"Q {res['costo_p_persona']:.2f}")
+                    col2.metric("Precio por persona",  f"Q {res['precio_p_persona']:.2f}")
+                    col3.metric("Margen aplicado",     f"{margen}%")
+
+                    st.markdown("---")
+
+                    # Perfil nutricional
+                    st.markdown("**🥗 Perfil nutricional del menú completo:**")
+                    col1,col2,col3=st.columns(3)
+                    col1.metric("🔥 Calorías totales",     f"{res['calorias_total']:.0f} kcal")
+                    col2.metric("💪 Proteínas totales",    f"{res['proteinas_total']:.1f} g")
+                    col3.metric("🥦 Ingredientes vegetales", res['vegetales_total'])
+
+                    st.markdown("---")
+
+                    # Desglose por receta
+                    st.markdown("**📋 Desglose por receta:**")
+                    df=pd.DataFrame(res["detalle_recetas"])
+                    df.columns=["Receta","Costo Q","Calorías","Proteínas g","Vegetales"]
+                    df["% del costo"]=df["Costo Q"].apply(lambda x: f"{x/res['costo_total']*100:.1f}%")
+                    st.dataframe(df,use_container_width=True,hide_index=True)
+
+        with tab_comparar:
+            st.markdown("Compara todos los menús según categoría y tamaño de ración.")
+            c1,c2,c3=st.columns(3)
+            f_cat=c1.selectbox("Filtrar por categoría",["Todas"]+[CATS_LBL[k] for k in CATS],key="cmp_cat")
+            f_rac=c2.selectbox("Filtrar por ración",["Todas"]+[str(r) for r in RACIONES],key="cmp_rac")
+            f_mar=c3.slider("Margen %",10,80,35,key="cmp_mar")
+            f_emp=st.number_input("Costo empaque Q",min_value=0.0,step=0.5,value=5.0,key="cmp_emp")
+
+            if st.button("🔍 Comparar menús",type="primary",key="btn_cmp"):
+                cat_key=CATS[([CATS_LBL[k] for k in CATS]).index(f_cat)] if f_cat!="Todas" else None
+                rac_key=int(f_rac) if f_rac!="Todas" else None
+                resultados=comparar_menus(cat_key,rac_key,f_mar,f_emp)
+
+                if not resultados:
+                    st.warning("Sin menús para los filtros seleccionados.")
+                else:
+                    # Tabla resumen
+                    rows=[]
+                    for r in resultados:
+                        rows.append({
+                            "Menú":              r["menu"]["nombre"],
+                            "Categoría":         CATS_LBL[r["menu"]["categoria"]],
+                            "Ración":            f"{r['racion']} personas",
+                            "Costo total Q":     r["costo_total"],
+                            "Precio sugerido Q": r["precio_sugerido"],
+                            "Ganancia Q":        r["ganancia"],
+                            "Costo/persona Q":   r["costo_p_persona"],
+                            "Precio/persona Q":  r["precio_p_persona"],
+                            "Proteínas g":       r["proteinas_total"],
+                            "Vegetales":         r["vegetales_total"],
+                        })
+                    df=pd.DataFrame(rows)
+
+                    # Destacar más económico, más proteico y más vegetales
+                    min_costo=df["Costo total Q"].min()
+                    max_prot=df["Proteínas g"].max()
+                    max_veg=df["Vegetales"].max()
+
+                    def highlight(row):
+                        if row["Costo total Q"]==min_costo:
+                            return ["background-color:#fef9c3"]*len(row)
+                        if row["Proteínas g"]==max_prot:
+                            return ["background-color:#dbeafe"]*len(row)
+                        if row["Vegetales"]==max_veg:
+                            return ["background-color:#dcfce7"]*len(row)
+                        return [""]*len(row)
+
+                    st.dataframe(df.style.apply(highlight,axis=1),use_container_width=True,hide_index=True)
+                    st.markdown("""
+                    🟡 **Amarillo** = más económico &nbsp;|&nbsp;
+                    🔵 **Azul** = mayor proteína &nbsp;|&nbsp;
+                    🟢 **Verde** = más vegetales
+                    """)
+
+                    # Recomendaciones automáticas
+                    st.markdown("---")
+                    st.markdown("**🏆 Recomendaciones automáticas:**")
+                    col1,col2,col3=st.columns(3)
+                    mas_eco=min(resultados,key=lambda x:x["costo_total"])
+                    mas_prot=max(resultados,key=lambda x:x["proteinas_total"])
+                    mas_veg=max(resultados,key=lambda x:x["vegetales_total"])
+                    col1.success(f"💰 **Más económico**\n\n{mas_eco['menu']['nombre']}\nQ {mas_eco['costo_total']:.2f}")
+                    col2.info(f"💪 **Mayor proteína**\n\n{mas_prot['menu']['nombre']}\n{mas_prot['proteinas_total']:.1f} g")
+                    col3.success(f"🥦 **Más vegetales**\n\n{mas_veg['menu']['nombre']}\n{mas_veg['vegetales_total']} ingredientes")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CAJAS
 # ══════════════════════════════════════════════════════════════════════════════
 elif pagina == "📦 Cajas":
     st.subheader("📦 Cajas")
-    tab_ver,tab_nuevo,tab_editar,tab_rec = st.tabs(["📄 Ver todas","➕ Nueva","✏️ Editar caja","🔗 Editar recetas"])
+    tab_ver,tab_nuevo,tab_editar,tab_rec=st.tabs(["📄 Ver todas","➕ Nueva","✏️ Editar","🔗 Recetas"])
 
     with tab_nuevo:
-        c1,c2,c3 = st.columns(3)
-        cn = c1.text_input("Nombre *",     key="caja_new_nombre")
-        cd = c2.text_input("Descripción",  key="caja_new_desc")
-        cp = c3.number_input("Precio venta Q", min_value=0.0, step=5.0, key="caja_new_precio")
-        if st.button("💾 Crear caja", type="primary", key="btn_caja_crear"):
-            if not cn.strip():
-                st.error("Nombre obligatorio.")
+        c1,c2,c3=st.columns(3)
+        cn=c1.text_input("Nombre *",key="cj_n"); cd=c2.text_input("Descripción",key="cj_d"); cp=c3.number_input("Precio Q",min_value=0.0,step=5.0,key="cj_p")
+        if st.button("💾 Crear caja",type="primary",key="btn_cjnew"):
+            if not cn.strip(): st.error("Nombre obligatorio.")
             else:
-                agregar_caja(cn.strip(), cd.strip(), cp)
-                st.success(f"✅ Caja **{cn}** creada."); st.rerun()
+                agregar_caja(cn.strip(),cd.strip(),cp)
+                st.success(f"✅ **{cn}** creada."); st.rerun()
 
     with tab_ver:
-        cajas = get_cajas()
+        cajas=get_cajas()
         if cajas:
             for c in cajas:
-                recs    = get_caja_recetas(c["id"])
-                nombres = ", ".join(r["nombre"] for r in recs) or "Sin recetas"
-                with st.expander(f"**{c['nombre']}** — Q {c['precio_venta']:.2f} | {len(recs)} recetas"):
-                    st.write(f"**Descripción:** {c['descripcion']}")
+                recs=get_caja_recetas(c["id"]); nombres=", ".join(r["nombre"] for r in recs) or "Sin recetas"
+                with st.expander(f"**{c['nombre']}** — Q {c['precio_venta']:.2f}"):
                     st.write(f"**Recetas:** {nombres}")
-        else:
-            st.info("Sin cajas.")
+        else: st.info("Sin cajas.")
 
     with tab_editar:
-        cajas = get_cajas()
-        if not cajas:
-            st.info("Sin cajas.")
-        else:
-            caja_opts = {c["nombre"]: c for c in cajas}
-            sel  = st.selectbox("Selecciona caja", list(caja_opts.keys()), key="caja_edit_sel")
-            caja = caja_opts[sel]
-            st.markdown("---")
-            c1,c2,c3 = st.columns(3)
-            en = c1.text_input("Nombre",      value=caja["nombre"],      key="caja_edit_nombre")
-            ed = c2.text_input("Descripción", value=caja["descripcion"], key="caja_edit_desc")
-            ep = c3.number_input("Precio Q",  min_value=0.0, step=5.0,   value=float(caja["precio_venta"]), key="caja_edit_precio")
-            col1,col2 = st.columns(2)
-            if col1.button("💾 Guardar cambios", type="primary", key="btn_caja_update"):
+        cajas=get_cajas()
+        if cajas:
+            co={c["nombre"]:c for c in cajas}
+            sel=st.selectbox("Caja",list(co.keys()),key="cjedit_sel"); caja=co[sel]
+            c1,c2,c3=st.columns(3)
+            en=c1.text_input("Nombre",value=caja["nombre"],key="cje_n"); ed=c2.text_input("Descripción",value=caja["descripcion"],key="cje_d"); ep=c3.number_input("Precio Q",min_value=0.0,step=5.0,value=float(caja["precio_venta"]),key="cje_p")
+            col1,col2=st.columns(2)
+            if col1.button("💾 Guardar",type="primary",key="btn_cjupd"):
                 with get_connection() as conn:
-                    conn.execute("UPDATE cajas SET nombre=?,descripcion=?,precio_venta=? WHERE id=?",
-                                 (en.strip(),ed.strip(),ep,caja["id"]))
-                st.success(f"✅ **{en}** actualizado."); st.rerun()
-            if col2.button("🗑 Eliminar caja", type="secondary", key="btn_caja_delete"):
+                    conn.execute("UPDATE cajas SET nombre=?,descripcion=?,precio_venta=? WHERE id=?",(en.strip(),ed.strip(),ep,caja["id"]))
+                st.success("✅ Actualizado."); st.rerun()
+            if col2.button("🗑 Eliminar",type="secondary",key="btn_cjdel"):
                 with get_connection() as conn:
-                    conn.execute("DELETE FROM caja_recetas WHERE caja_id=?", (caja["id"],))
-                    conn.execute("UPDATE cajas SET activa=0 WHERE id=?", (caja["id"],))
+                    conn.execute("DELETE FROM caja_recetas WHERE caja_id=?",(caja["id"],))
+                    conn.execute("UPDATE cajas SET activa=0 WHERE id=?",(caja["id"],))
                 st.warning(f"🗑 **{caja['nombre']}** eliminada."); st.rerun()
 
     with tab_rec:
-        cajas   = get_cajas()
-        recetas = get_recetas()
-        if not cajas:
-            st.warning("Primero crea una caja.")
-        elif not recetas:
-            st.warning("Primero crea recetas.")
+        cajas=get_cajas(); recetas=get_recetas()
+        if not cajas: st.warning("Primero crea una caja.")
+        elif not recetas: st.warning("Primero crea recetas.")
         else:
-            caja_opts = {c["nombre"]: c["id"] for c in cajas}
-            rec_opts  = {r["nombre"]: r["id"] for r in recetas}
-            sel_caja  = st.selectbox("Caja", list(caja_opts.keys()), key="cajarec_caja_sel")
-            cid       = caja_opts[sel_caja]
-            actuales  = get_caja_recetas(cid)
-
+            co={c["nombre"]:c["id"] for c in cajas}; ro={r["nombre"]:r["id"] for r in recetas}
+            sel_c=st.selectbox("Caja",list(co.keys()),key="cjrec_csel"); cid=co[sel_c]
+            actuales=get_caja_recetas(cid)
             if actuales:
-                st.markdown("**Recetas actuales:**")
                 for r in actuales:
-                    col1,col2 = st.columns([4,1])
-                    col1.write(f"• {r['nombre']}")
-                    if col2.button("🗑", key=f"del_cr_{r['id']}"):
+                    col1,col2=st.columns([4,1]); col1.write(f"• {r['nombre']}")
+                    if col2.button("🗑",key=f"dcr_{r['id']}"):
                         with get_connection() as conn:
-                            conn.execute("DELETE FROM caja_recetas WHERE id=?", (r["id"],))
-                        st.warning("🗑 Receta removida."); st.rerun()
-            else:
-                st.info("Sin recetas asignadas.")
-
-            st.markdown("---")
-            sel_rec = st.selectbox("Receta a agregar", list(rec_opts.keys()), key="cajarec_rec_sel")
-            if st.button("➕ Agregar receta", type="primary", key="btn_cajarec_add"):
-                agregar_receta_a_caja(cid, rec_opts[sel_rec])
+                            conn.execute("DELETE FROM caja_recetas WHERE id=?",(r["id"],))
+                        st.rerun()
+            else: st.info("Sin recetas.")
+            sel_r=st.selectbox("Agregar receta",list(ro.keys()),key="cjrec_rsel")
+            if st.button("➕ Agregar",type="primary",key="btn_cjradd"):
+                agregar_receta_a_caja(cid,ro[sel_r])
                 st.success("✅ Receta agregada."); st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -412,129 +570,95 @@ elif pagina == "📦 Cajas":
 # ══════════════════════════════════════════════════════════════════════════════
 elif pagina == "📬 Pedidos":
     st.subheader("📬 Pedidos")
-    cajas = get_cajas()
-    tab_nuevo,tab_ver,tab_estado = st.tabs(["➕ Nuevo pedido","📄 Ver pedidos","🔄 Cambiar estado"])
+    cajas=get_cajas()
+    tab_nuevo,tab_ver,tab_estado=st.tabs(["➕ Nuevo pedido","📄 Ver pedidos","🔄 Cambiar estado"])
 
     with tab_nuevo:
-        if not cajas:
-            st.warning("Primero crea cajas.")
+        if not cajas: st.warning("Primero crea cajas.")
         else:
-            c1,c2 = st.columns(2)
-            cliente   = c1.text_input("Cliente *",         key="ped_new_cliente")
-            fecha_ent = c2.date_input("Fecha de entrega",  key="ped_new_fecha", min_value=date.today())
-            caja_opts = {c["nombre"]: c["id"] for c in cajas}
-
-            if "items_pedido" not in st.session_state:
-                st.session_state.items_pedido = []
-
-            st.markdown("**Cajas del pedido:**")
-            st.caption("💡 Las porciones aplican igual para todas las recetas de la caja.")
-            c1,c2,c3 = st.columns(3)
-            sel_caja  = c1.selectbox("Caja",                   list(caja_opts.keys()), key="ped_new_caja")
-            cantidad  = c2.number_input("Cantidad de cajas",   min_value=1, value=1,   key="ped_new_cant")
-            porciones = c3.number_input("Porciones por receta",min_value=0.5, value=1.0, step=0.5, key="ped_new_porc")
-
-            col1,col2 = st.columns([1,3])
-            if col1.button("➕ Agregar ítem", key="btn_ped_add_item"):
-                st.session_state.items_pedido.append({
-                    "caja_id": caja_opts[sel_caja], "nombre": sel_caja,
-                    "cantidad": cantidad, "porciones": porciones})
-            if col2.button("🗑 Limpiar", key="btn_ped_clear"):
-                st.session_state.items_pedido = []
-
+            c1,c2=st.columns(2)
+            cliente=c1.text_input("Cliente *",key="ped_cli"); fecha_ent=c2.date_input("Fecha entrega",min_value=date.today(),key="ped_fec")
+            co={c["nombre"]:c["id"] for c in cajas}
+            if "items_pedido" not in st.session_state: st.session_state.items_pedido=[]
+            c1,c2,c3=st.columns(3)
+            sc=c1.selectbox("Caja",list(co.keys()),key="ped_caja")
+            cant=c2.number_input("Cantidad",min_value=1,value=1,key="ped_cant")
+            porc=c3.number_input("Porciones",min_value=0.5,value=1.0,step=0.5,key="ped_porc")
+            col1,col2=st.columns([1,3])
+            if col1.button("➕ Agregar",key="btn_ped_add"):
+                st.session_state.items_pedido.append({"caja_id":co[sc],"nombre":sc,"cantidad":cant,"porciones":porc})
+            if col2.button("🗑 Limpiar",key="btn_ped_clr"): st.session_state.items_pedido=[]
             if st.session_state.items_pedido:
-                df = pd.DataFrame(st.session_state.items_pedido)[["nombre","cantidad","porciones"]]
-                df["Factor MRP"] = df["cantidad"] * df["porciones"]
-                df.columns = ["Caja","Cajas","Porciones","Factor MRP"]
-                st.dataframe(df, use_container_width=True, hide_index=True)
-
-                if st.button("💾 Guardar pedido", type="primary", key="btn_ped_guardar"):
-                    if not cliente.strip():
-                        st.error("Cliente obligatorio.")
+                df=pd.DataFrame(st.session_state.items_pedido)[["nombre","cantidad","porciones"]]
+                df["Factor"]=df["cantidad"]*df["porciones"]; df.columns=["Caja","Cajas","Porciones","Factor MRP"]
+                st.dataframe(df,use_container_width=True,hide_index=True)
+                if st.button("💾 Guardar pedido",type="primary",key="btn_ped_save"):
+                    if not cliente.strip(): st.error("Cliente obligatorio.")
                     else:
-                        items = [{"caja_id":i["caja_id"],"cantidad":i["cantidad"],"porciones":i["porciones"]}
-                                 for i in st.session_state.items_pedido]
-                        pid = crear_pedido(cliente.strip(), fecha_ent.strftime("%Y-%m-%d"), items)
-                        st.success(f"✅ Pedido #{pid} para **{cliente}**.")
-                        st.session_state.items_pedido = []; st.rerun()
+                        items=[{"caja_id":i["caja_id"],"cantidad":i["cantidad"],"porciones":i["porciones"]} for i in st.session_state.items_pedido]
+                        pid=crear_pedido(cliente.strip(),fecha_ent.strftime("%Y-%m-%d"),items)
+                        st.success(f"✅ Pedido #{pid} guardado."); st.session_state.items_pedido=[]; st.rerun()
 
     with tab_ver:
-        rows = get_pedidos()
+        rows=get_pedidos()
         if rows:
-            df = pd.DataFrame(rows)[["id","cliente","caja","cantidad","porciones","fecha_entrega","estado"]]
-            df.columns = ["#","Cliente","Caja","Cajas","Porciones","Fecha entrega","Estado"]
-            st.dataframe(df, use_container_width=True, hide_index=True)
-        else:
-            st.success("✅ Sin pedidos.")
+            df=pd.DataFrame(rows)[["id","cliente","caja","cantidad","porciones","fecha_entrega","estado"]]
+            df.columns=["#","Cliente","Caja","Cajas","Porciones","Fecha","Estado"]
+            st.dataframe(df,use_container_width=True,hide_index=True)
+        else: st.success("✅ Sin pedidos.")
 
     with tab_estado:
-        rows = get_pedidos()
-        if not rows:
-            st.info("Sin pedidos.")
-        else:
-            ped_unicos = {}
+        rows=get_pedidos()
+        if rows:
+            pu={}
             for r in rows:
-                if r["id"] not in ped_unicos: ped_unicos[r["id"]] = r
-            opts = {f"#{p['id']} — {p['cliente']} ({p['fecha_entrega']})": p for p in ped_unicos.values()}
-            sel  = st.selectbox("Pedido", list(opts.keys()), key="ped_estado_sel")
-            ped  = opts[sel]
-            nuevo_estado = st.selectbox("Nuevo estado", ESTADOS,
-                                        index=ESTADOS.index(ped["estado"]), key="ped_estado_nuevo")
-            if st.button("💾 Actualizar estado", type="primary", key="btn_ped_estado"):
+                if r["id"] not in pu: pu[r["id"]]=r
+            opts={f"#{p['id']} — {p['cliente']}":p for p in pu.values()}
+            sel=st.selectbox("Pedido",list(opts.keys()),key="ped_esel"); ped=opts[sel]
+            ne=st.selectbox("Nuevo estado",ESTADOS,index=ESTADOS.index(ped["estado"]),key="ped_enew")
+            if st.button("💾 Actualizar",type="primary",key="btn_ped_est"):
                 with get_connection() as conn:
-                    conn.execute("UPDATE pedidos SET estado=? WHERE id=?", (nuevo_estado, ped["id"]))
-                st.success(f"✅ Pedido #{ped['id']} → **{nuevo_estado}**."); st.rerun()
+                    conn.execute("UPDATE pedidos SET estado=? WHERE id=?",(ne,ped["id"]))
+                st.success(f"✅ Pedido #{ped['id']} → **{ne}**."); st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MRP
 # ══════════════════════════════════════════════════════════════════════════════
 elif pagina == "⚙️ MRP":
     st.subheader("⚙️ Cálculo MRP")
-    col1,col2 = st.columns([2,1])
-    buffer = col2.slider("Buffer %", 0, 50, 10, key="mrp_buffer")
-
-    if col1.button("⚙️ Calcular requerimientos", type="primary", use_container_width=True, key="btn_mrp_calc"):
-        st.session_state.mrp_reqs = calcular_requerimientos()
+    col1,col2=st.columns([2,1]); buffer=col2.slider("Buffer %",0,50,10,key="mrp_buf")
+    if col1.button("⚙️ Calcular requerimientos",type="primary",use_container_width=True,key="btn_mrp"):
+        st.session_state.mrp_reqs=calcular_requerimientos()
 
     if "mrp_reqs" in st.session_state and st.session_state.mrp_reqs:
-        reqs  = st.session_state.mrp_reqs
-        falta = [d for d in reqs.values() if d["faltante"]]
-        ok_   = [d for d in reqs.values() if not d["faltante"]]
-        costo = sum(d["neto"]*d["costo"] for d in falta)
-
-        m1,m2,m3,m4 = st.columns(4)
-        m1.metric("Analizados",     len(reqs))
-        m2.metric("⚠ Faltante",     len(falta))
-        m3.metric("✅ OK",           len(ok_))
-        m4.metric("Costo estimado", f"Q {costo:.2f}")
-
+        reqs=st.session_state.mrp_reqs
+        falta=[d for d in reqs.values() if d["faltante"]]; ok_=[d for d in reqs.values() if not d["faltante"]]
+        costo=sum(d["neto"]*d["costo"] for d in falta)
+        m1,m2,m3,m4=st.columns(4)
+        m1.metric("Analizados",len(reqs)); m2.metric("⚠ Faltante",len(falta))
+        m3.metric("✅ OK",len(ok_)); m4.metric("Costo estimado",f"Q {costo:.2f}")
         st.markdown("---")
-        rows = [{"Ingrediente": d["nombre"],
-                 "Requerido":   f"{d['requerido']:.3f} {d['unidad']}",
-                 "Stock":       d["stock"],
-                 "Neto faltante": d["neto"] if d["faltante"] else 0,
-                 "Costo Q":     round(d["neto"]*d["costo"],2) if d["faltante"] else 0,
-                 "Estado":      "⚠ FALTA" if d["faltante"] else "✅ OK"}
-                for _,d in sorted(reqs.items(), key=lambda x:(-x[1]["faltante"],x[1]["nombre"]))]
-        df = pd.DataFrame(rows)
+        rows=[{"Ingrediente":d["nombre"],"Requerido":f"{d['requerido']:.3f} {d['unidad']}",
+               "Stock":d["stock"],"Neto faltante":d["neto"] if d["faltante"] else 0,
+               "Costo Q":round(d["neto"]*d["costo"],2) if d["faltante"] else 0,
+               "Estado":"⚠ FALTA" if d["faltante"] else "✅ OK"}
+              for _,d in sorted(reqs.items(),key=lambda x:(-x[1]["faltante"],x[1]["nombre"]))]
+        df=pd.DataFrame(rows)
         def ce(row): return ["background-color:#fee2e2"]*len(row) if row["Estado"]=="⚠ FALTA" else ["background-color:#f0fdf4"]*len(row)
-        st.dataframe(df.style.apply(ce,axis=1), use_container_width=True, hide_index=True)
-
+        st.dataframe(df.style.apply(ce,axis=1),use_container_width=True,hide_index=True)
         st.markdown("---")
-        if st.button("📋 Generar Órdenes de Compra", type="primary", use_container_width=True, key="btn_mrp_oc"):
-            ordenes = generar_ordenes_compra(reqs, buffer_pct=buffer/100)
-            if not ordenes:
-                st.success("✅ Stock suficiente, sin órdenes necesarias.")
+        if st.button("📋 Generar Órdenes de Compra",type="primary",use_container_width=True,key="btn_oc"):
+            ordenes=generar_ordenes_compra(reqs,buffer_pct=buffer/100)
+            if not ordenes: st.success("✅ Stock suficiente.")
             else:
                 for o in ordenes:
-                    pv = Q("SELECT nombre FROM proveedores WHERE id=?", (o["proveedor_id"],))
-                    pnombre = pv[0]["nombre"] if pv else "Sin proveedor"
-                    with st.expander(f"📋 Orden #{o['orden_id']} — {pnombre} | Q {o['total']:.2f}", expanded=True):
+                    pv=Q("SELECT nombre FROM proveedores WHERE id=?",(o["proveedor_id"],))
+                    pn=pv[0]["nombre"] if pv else "Sin proveedor"
+                    with st.expander(f"📋 Orden #{o['orden_id']} — {pn} | Q {o['total']:.2f}",expanded=True):
                         st.write(f"**Entrega:** {o['fecha']}")
-                        df2 = pd.DataFrame(o["items"])[["nombre","neto","cantidad","costo"]]
-                        df2["subtotal"] = df2["cantidad"]*df2["costo"]
-                        df2.columns = ["Ingrediente","Neto",f"Con buffer {buffer}%","Costo unit.","Subtotal Q"]
-                        st.dataframe(df2, use_container_width=True, hide_index=True)
-
+                        df2=pd.DataFrame(o["items"])[["nombre","neto","cantidad","costo"]]
+                        df2["subtotal"]=df2["cantidad"]*df2["costo"]
+                        df2.columns=["Ingrediente","Neto",f"Con buffer {buffer}%","Costo unit.","Subtotal Q"]
+                        st.dataframe(df2,use_container_width=True,hide_index=True)
     elif "mrp_reqs" in st.session_state and not st.session_state.mrp_reqs:
         st.warning("⚠ Sin pedidos pendientes.")
