@@ -1,6 +1,6 @@
 """
-database.py — MRP Delivery
-Modelo: Pedido → (Caja, cantidad_cajas, porciones) → Recetas de la Caja → Ingredientes
+database.py — MRP Delivery (v3)
+Nuevo: menús, info nutricional por receta, costos por paquete
 """
 import sqlite3
 
@@ -16,6 +16,7 @@ def init_db():
     c = get_connection()
     cur = c.cursor()
 
+    # ── Proveedores ───────────────────────────────────────────────
     cur.execute("""CREATE TABLE IF NOT EXISTS proveedores (
         id        INTEGER PRIMARY KEY AUTOINCREMENT,
         nombre    TEXT    NOT NULL,
@@ -26,6 +27,7 @@ def init_db():
         activo    INTEGER NOT NULL DEFAULT 1
     )""")
 
+    # ── Ingredientes ──────────────────────────────────────────────
     cur.execute("""CREATE TABLE IF NOT EXISTS ingredientes (
         id             INTEGER PRIMARY KEY AUTOINCREMENT,
         nombre         TEXT NOT NULL,
@@ -35,10 +37,14 @@ def init_db():
         stock_actual   REAL NOT NULL DEFAULT 0,
         stock_minimo   REAL NOT NULL DEFAULT 0,
         costo_unitario REAL NOT NULL DEFAULT 0,
+        -- Info nutricional por unidad del ingrediente
+        calorias       REAL NOT NULL DEFAULT 0,
+        proteinas_g    REAL NOT NULL DEFAULT 0,
+        vegetales      INTEGER NOT NULL DEFAULT 0,  -- 1 si es vegetal
         proveedor_id   INTEGER REFERENCES proveedores(id)
     )""")
 
-    # Receta individual con su BOM (ingredientes por porción)
+    # ── Recetas ───────────────────────────────────────────────────
     cur.execute("""CREATE TABLE IF NOT EXISTS recetas (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         nombre      TEXT NOT NULL,
@@ -46,6 +52,7 @@ def init_db():
         activa      INTEGER NOT NULL DEFAULT 1
     )""")
 
+    # BOM receta: ingredientes por porción
     cur.execute("""CREATE TABLE IF NOT EXISTS receta_ingredientes (
         id             INTEGER PRIMARY KEY AUTOINCREMENT,
         receta_id      INTEGER NOT NULL REFERENCES recetas(id),
@@ -54,7 +61,28 @@ def init_db():
         UNIQUE(receta_id, ingrediente_id)
     )""")
 
-    # Caja = conjunto fijo de recetas
+    # ── Menús ─────────────────────────────────────────────────────
+    # Un menú es una combinación de recetas con una categoría y tamaño de ración
+    cur.execute("""CREATE TABLE IF NOT EXISTS menus (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        nombre      TEXT NOT NULL,
+        descripcion TEXT DEFAULT '',
+        categoria   TEXT NOT NULL DEFAULT 'nivel_medio'
+                        CHECK(categoria IN ('economico','nivel_medio','alto_proteina','vegetariano','alto_vegetales')),
+        racion      INTEGER NOT NULL DEFAULT 2
+                        CHECK(racion IN (2,4,6)),
+        activo      INTEGER NOT NULL DEFAULT 1
+    )""")
+
+    # Recetas que componen cada menú
+    cur.execute("""CREATE TABLE IF NOT EXISTS menu_recetas (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        menu_id   INTEGER NOT NULL REFERENCES menus(id),
+        receta_id INTEGER NOT NULL REFERENCES recetas(id),
+        UNIQUE(menu_id, receta_id)
+    )""")
+
+    # ── Cajas ─────────────────────────────────────────────────────
     cur.execute("""CREATE TABLE IF NOT EXISTS cajas (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
         nombre       TEXT NOT NULL,
@@ -63,7 +91,6 @@ def init_db():
         activa       INTEGER NOT NULL DEFAULT 1
     )""")
 
-    # Qué recetas contiene cada caja (estructura fija)
     cur.execute("""CREATE TABLE IF NOT EXISTS caja_recetas (
         id        INTEGER PRIMARY KEY AUTOINCREMENT,
         caja_id   INTEGER NOT NULL REFERENCES cajas(id),
@@ -71,7 +98,7 @@ def init_db():
         UNIQUE(caja_id, receta_id)
     )""")
 
-    # Pedido: cliente + fecha
+    # ── Pedidos ───────────────────────────────────────────────────
     cur.execute("""CREATE TABLE IF NOT EXISTS pedidos (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         cliente       TEXT NOT NULL,
@@ -81,15 +108,15 @@ def init_db():
             CHECK(estado IN ('pendiente','en_proceso','completado','cancelado'))
     )""")
 
-    # Detalle: qué caja, cuántas cajas y cuántas porciones (igual para todas las recetas de esa caja)
     cur.execute("""CREATE TABLE IF NOT EXISTS pedido_detalle (
         id        INTEGER PRIMARY KEY AUTOINCREMENT,
         pedido_id INTEGER NOT NULL REFERENCES pedidos(id),
         caja_id   INTEGER NOT NULL REFERENCES cajas(id),
-        cantidad  INTEGER NOT NULL DEFAULT 1,  -- número de cajas
-        porciones REAL    NOT NULL DEFAULT 1   -- porciones por receta (igual para todas)
+        cantidad  INTEGER NOT NULL DEFAULT 1,
+        porciones REAL    NOT NULL DEFAULT 1
     )""")
 
+    # ── Órdenes de compra ─────────────────────────────────────────
     cur.execute("""CREATE TABLE IF NOT EXISTS ordenes_compra (
         id                     INTEGER PRIMARY KEY AUTOINCREMENT,
         proveedor_id           INTEGER NOT NULL REFERENCES proveedores(id),
