@@ -17,6 +17,40 @@ from mrp_engine import (
 st.set_page_config(page_title="MRP — Cajas Delivery", page_icon="🥗", layout="wide")
 init_db()
 
+# ── Migración automática ──────────────────────────────────────────────────────
+def _col_existe(cur, tabla, col):
+    cur.execute(f"PRAGMA table_info({tabla})")
+    return any(r[1]==col for r in cur.fetchall())
+
+def _tabla_existe(cur, tabla):
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (tabla,))
+    return cur.fetchone() is not None
+
+def auto_migrar():
+    with get_connection() as conn:
+        cur = conn.cursor()
+        for col, defn in [("calorias","REAL NOT NULL DEFAULT 0"),
+                          ("proteinas_g","REAL NOT NULL DEFAULT 0"),
+                          ("vegetales","INTEGER NOT NULL DEFAULT 0")]:
+            if not _col_existe(cur, "ingredientes", col):
+                cur.execute(f"ALTER TABLE ingredientes ADD COLUMN {col} {defn}")
+        if not _tabla_existe(cur, "menus"):
+            cur.execute("""CREATE TABLE menus (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                nombre TEXT NOT NULL, descripcion TEXT DEFAULT '',
+                categoria TEXT NOT NULL DEFAULT 'nivel_medio'
+                    CHECK(categoria IN ('economico','nivel_medio','alto_proteina','vegetariano','alto_vegetales')),
+                racion INTEGER NOT NULL DEFAULT 2 CHECK(racion IN (2,4,6)),
+                activo INTEGER NOT NULL DEFAULT 1)""")
+        if not _tabla_existe(cur, "menu_recetas"):
+            cur.execute("""CREATE TABLE menu_recetas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                menu_id INTEGER NOT NULL REFERENCES menus(id),
+                receta_id INTEGER NOT NULL REFERENCES recetas(id),
+                UNIQUE(menu_id, receta_id))""")
+
+auto_migrar()
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def Q(sql, p=()):
     with get_connection() as c:
