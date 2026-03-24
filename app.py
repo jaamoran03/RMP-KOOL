@@ -1,6 +1,6 @@
 """
-app.py — MRP Cajas de Alimentos Delivery (v3)
-Incluye: Menús, Costeo por paquete, Perfil nutricional
+app.py — MRP Cajas de Alimentos Delivery
+Base de datos permanente en Supabase (PostgreSQL)
 """
 import streamlit as st
 import pandas as pd
@@ -17,91 +17,80 @@ from mrp_engine import (
 st.set_page_config(page_title="MRP — Cajas Delivery", page_icon="🥗", layout="wide")
 init_db()
 
-# ── Migración automática ──────────────────────────────────────────────────────
-def _col_existe(cur, tabla, col):
-    cur.execute(f"PRAGMA table_info({tabla})")
-    return any(r[1]==col for r in cur.fetchall())
-
-def _tabla_existe(cur, tabla):
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (tabla,))
-    return cur.fetchone() is not None
-
-def auto_migrar():
-    with get_connection() as conn:
-        cur = conn.cursor()
-        for col, defn in [("calorias","REAL NOT NULL DEFAULT 0"),
-                          ("proteinas_g","REAL NOT NULL DEFAULT 0"),
-                          ("vegetales","INTEGER NOT NULL DEFAULT 0")]:
-            if not _col_existe(cur, "ingredientes", col):
-                cur.execute(f"ALTER TABLE ingredientes ADD COLUMN {col} {defn}")
-        if not _tabla_existe(cur, "menus"):
-            cur.execute("""CREATE TABLE menus (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nombre TEXT NOT NULL, descripcion TEXT DEFAULT '',
-                categoria TEXT NOT NULL DEFAULT 'nivel_medio'
-                    CHECK(categoria IN ('economico','nivel_medio','alto_proteina','vegetariano','alto_vegetales')),
-                racion INTEGER NOT NULL DEFAULT 2 CHECK(racion IN (2,4,6)),
-                activo INTEGER NOT NULL DEFAULT 1)""")
-        if not _tabla_existe(cur, "menu_recetas"):
-            cur.execute("""CREATE TABLE menu_recetas (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                menu_id INTEGER NOT NULL REFERENCES menus(id),
-                receta_id INTEGER NOT NULL REFERENCES recetas(id),
-                UNIQUE(menu_id, receta_id))""")
-
-auto_migrar()
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers DB ────────────────────────────────────────────────────────────────
 def Q(sql, p=()):
-    with get_connection() as c:
-        return [dict(r) for r in c.execute(sql, p).fetchall()]
+    conn = get_connection()
+    cur  = conn.cursor()
+    cur.execute(sql, p)
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return rows
 
-def get_proveedores():  return Q("SELECT id,nombre,contacto,telefono,email,lead_time FROM proveedores WHERE activo=1")
-def get_ingredientes(): return Q("""SELECT i.*,COALESCE(p.nombre,'—') proveedor
-    FROM ingredientes i LEFT JOIN proveedores p ON p.id=i.proveedor_id""")
-def get_recetas():      return Q("SELECT * FROM recetas WHERE activa=1")
-def get_cajas():        return Q("SELECT * FROM cajas WHERE activa=1")
-def get_menus():        return Q("SELECT * FROM menus WHERE activo=1 ORDER BY categoria,racion")
-def get_bom(rid):       return Q("""SELECT ri.id,ri.cantidad,i.id ing_id,i.nombre,i.unidad,
-    i.costo_unitario,i.calorias,i.proteinas_g,i.vegetales,COALESCE(p.nombre,'—') proveedor
-    FROM receta_ingredientes ri JOIN ingredientes i ON i.id=ri.ingrediente_id
-    LEFT JOIN proveedores p ON p.id=i.proveedor_id WHERE ri.receta_id=?""", (rid,))
-def get_caja_recetas(cid): return Q("""SELECT cr.id,r.id rec_id,r.nombre FROM caja_recetas cr
-    JOIN recetas r ON r.id=cr.receta_id WHERE cr.caja_id=?""", (cid,))
-def get_menu_recetas(mid):  return Q("""SELECT mr.id,r.id rec_id,r.nombre FROM menu_recetas mr
-    JOIN recetas r ON r.id=mr.receta_id WHERE mr.menu_id=?""", (mid,))
-def get_pedidos():      return Q("""SELECT p.id,p.cliente,p.fecha_entrega,p.estado,
-    c.nombre caja,pd.cantidad,pd.porciones,pd.id pd_id
-    FROM pedidos p JOIN pedido_detalle pd ON pd.pedido_id=p.id
-    JOIN cajas c ON c.id=pd.caja_id ORDER BY p.fecha_entrega""")
+def Qexec(sql, p=()):
+    conn = get_connection()
+    cur  = conn.cursor()
+    cur.execute(sql, p)
+    conn.commit()
+    cur.close(); conn.close()
 
-TIPOS    = ["fresco","condimento","empaque","otro"]
-ESTADOS  = ["pendiente","en_proceso","completado","cancelado"]
-CATS     = ["economico","nivel_medio","alto_proteina","vegetariano","alto_vegetales"]
+def get_proveedores():
+    return Q("SELECT id,nombre,contacto,telefono,email,lead_time FROM proveedores WHERE activo=1")
+
+def get_ingredientes():
+    return Q("""SELECT i.*,COALESCE(p.nombre,'—') proveedor
+                FROM ingredientes i LEFT JOIN proveedores p ON p.id=i.proveedor_id""")
+
+def get_recetas():
+    return Q("SELECT * FROM recetas WHERE activa=1")
+
+def get_cajas():
+    return Q("SELECT * FROM cajas WHERE activa=1")
+
+def get_menus():
+    return Q("SELECT * FROM menus WHERE activo=1 ORDER BY categoria,racion")
+
+def get_bom(rid):
+    return Q("""SELECT ri.id,ri.cantidad,i.id ing_id,i.nombre,i.unidad,
+                       i.costo_unitario,i.calorias,i.proteinas_g,i.vegetales,
+                       COALESCE(p.nombre,'—') proveedor
+                FROM receta_ingredientes ri
+                JOIN ingredientes i ON i.id=ri.ingrediente_id
+                LEFT JOIN proveedores p ON p.id=i.proveedor_id
+                WHERE ri.receta_id=%s""", (rid,))
+
+def get_caja_recetas(cid):
+    return Q("""SELECT cr.id,r.id rec_id,r.nombre FROM caja_recetas cr
+                JOIN recetas r ON r.id=cr.receta_id WHERE cr.caja_id=%s""", (cid,))
+
+def get_menu_recetas(mid):
+    return Q("""SELECT mr.id,r.id rec_id,r.nombre FROM menu_recetas mr
+                JOIN recetas r ON r.id=mr.receta_id WHERE mr.menu_id=%s""", (mid,))
+
+def get_pedidos():
+    return Q("""SELECT p.id,p.cliente,p.fecha_entrega,p.estado,
+                       c.nombre caja,pd.cantidad,pd.porciones,pd.id pd_id
+                FROM pedidos p JOIN pedido_detalle pd ON pd.pedido_id=p.id
+                JOIN cajas c ON c.id=pd.caja_id ORDER BY p.fecha_entrega""")
+
+TIPOS   = ["fresco","condimento","empaque","otro"]
+ESTADOS = ["pendiente","en_proceso","completado","cancelado"]
+CATS    = ["economico","nivel_medio","alto_proteina","vegetariano","alto_vegetales"]
 CATS_LBL = {"economico":"💰 Económico","nivel_medio":"⭐ Nivel Medio",
              "alto_proteina":"💪 Alto en Proteína","vegetariano":"🥦 Vegetariano",
              "alto_vegetales":"🥗 Alto en Vegetales"}
-RACIONES = [2, 4, 6]
+RACIONES = [2,4,6]
 
-# ── CSS ───────────────────────────────────────────────────────────────────────
 st.markdown("""<style>
 [data-testid="stSidebar"]{background:#0d1b2a}
 [data-testid="stSidebar"] *{color:#e8f5e9!important}
 .hdr{background:linear-gradient(120deg,#0d1b2a,#1b4332);color:#e8f5e9;
      padding:20px 28px;border-radius:12px;margin-bottom:20px}
 .hdr h1{margin:0;font-size:1.6rem}.hdr p{margin:4px 0 0;opacity:.65;font-size:.85rem}
-.cost-card{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:16px 20px;margin-bottom:10px}
-.cost-title{font-size:1rem;font-weight:700;color:#166534;margin-bottom:8px}
-.nut-pill{display:inline-block;padding:3px 10px;border-radius:20px;font-size:.78rem;
-          font-weight:600;margin:2px}
-.pill-cal{background:#fef9c3;color:#854d0e}
-.pill-prot{background:#dbeafe;color:#1e40af}
-.pill-veg{background:#dcfce7;color:#166534}
 </style>""", unsafe_allow_html=True)
 
 st.markdown("""<div class='hdr'>
 <h1>🥗 MRP — Cajas de Alimentos Delivery</h1>
-<p>Gestión de recetas · menús · costeo de paquetes · MRP · planificación</p>
+<p>Gestión de recetas · menús · costeo · MRP · planificación</p>
 </div>""", unsafe_allow_html=True)
 
 pagina = st.sidebar.radio("Navegación", [
@@ -117,9 +106,9 @@ if pagina == "📦 Proveedores":
     tab_ver,tab_nuevo,tab_editar = st.tabs(["📄 Ver todos","➕ Nuevo","✏️ Editar / Eliminar"])
 
     with tab_nuevo:
-        c1,c2,c3=st.columns(3)
+        c1,c2,c3 = st.columns(3)
         pn=c1.text_input("Nombre *",key="pn"); pc=c2.text_input("Contacto",key="pc"); pt=c3.text_input("Teléfono",key="pt")
-        c4,c5=st.columns(2)
+        c4,c5 = st.columns(2)
         pe=c4.text_input("Email",key="pe"); pl=c5.number_input("Lead time (días)",min_value=1,max_value=60,value=2,key="pl")
         if st.button("💾 Guardar proveedor",type="primary",key="btn_pnew"):
             if not pn.strip(): st.error("Nombre obligatorio.")
@@ -140,18 +129,19 @@ if pagina == "📦 Proveedores":
             opts={p["nombre"]:p for p in rows}
             sel=st.selectbox("Proveedor",list(opts.keys()),key="pedit_sel"); pv=opts[sel]
             c1,c2,c3=st.columns(3)
-            en=c1.text_input("Nombre",value=pv["nombre"],key="pe_n"); ec=c2.text_input("Contacto",value=pv["contacto"],key="pe_c"); et=c3.text_input("Teléfono",value=pv["telefono"],key="pe_t")
+            en=c1.text_input("Nombre",value=pv["nombre"],key="pe_n")
+            ec=c2.text_input("Contacto",value=pv["contacto"],key="pe_c")
+            et=c3.text_input("Teléfono",value=pv["telefono"],key="pe_t")
             c4,c5=st.columns(2)
-            ee=c4.text_input("Email",value=pv["email"],key="pe_e"); el=c5.number_input("Lead time",min_value=1,max_value=60,value=int(pv["lead_time"]),key="pe_l")
+            ee=c4.text_input("Email",value=pv["email"],key="pe_e")
+            el=c5.number_input("Lead time",min_value=1,max_value=60,value=int(pv["lead_time"]),key="pe_l")
             col1,col2=st.columns(2)
             if col1.button("💾 Guardar",type="primary",key="btn_pupd"):
-                with get_connection() as conn:
-                    conn.execute("UPDATE proveedores SET nombre=?,contacto=?,telefono=?,email=?,lead_time=? WHERE id=?",
-                                 (en.strip(),ec.strip(),et.strip(),ee.strip(),int(el),pv["id"]))
+                Qexec("UPDATE proveedores SET nombre=%s,contacto=%s,telefono=%s,email=%s,lead_time=%s WHERE id=%s",
+                      (en.strip(),ec.strip(),et.strip(),ee.strip(),int(el),pv["id"]))
                 st.success("✅ Actualizado."); st.rerun()
             if col2.button("🗑 Eliminar",type="secondary",key="btn_pdel"):
-                with get_connection() as conn:
-                    conn.execute("UPDATE proveedores SET activo=0 WHERE id=?",(pv["id"],))
+                Qexec("UPDATE proveedores SET activo=0 WHERE id=%s",(pv["id"],))
                 st.warning(f"🗑 **{pv['nombre']}** eliminado."); st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -183,7 +173,7 @@ elif pagina == "🥬 Ingredientes":
         i_sm=c5.number_input("Stock mínimo",min_value=0.0,step=0.1,key="in_sm")
         i_co=c6.number_input("Costo Q",min_value=0.0,step=0.5,key="in_co")
         i_pv=c7.selectbox("Proveedor",prov_lista,key="in_pv")
-        st.markdown("**Info nutricional** *(por unidad del ingrediente)*")
+        st.markdown("**Info nutricional** *(por unidad)*")
         c1,c2,c3=st.columns(3)
         i_cal=c1.number_input("Calorías",min_value=0.0,step=1.0,key="in_cal")
         i_pro=c2.number_input("Proteínas (g)",min_value=0.0,step=0.1,key="in_pro")
@@ -217,14 +207,12 @@ elif pagina == "🥬 Ingredientes":
             eveg=c3.checkbox("¿Es vegetal?",value=bool(ing["vegetales"]),key="ie_veg")
             col1,col2=st.columns(2)
             if col1.button("💾 Guardar cambios",type="primary",key="btn_iupd"):
-                with get_connection() as conn:
-                    conn.execute("UPDATE ingredientes SET nombre=?,tipo=?,unidad=?,stock_minimo=?,costo_unitario=?,proveedor_id=?,calorias=?,proteinas_g=?,vegetales=? WHERE id=?",
-                                 (en.strip(),et,eu.strip(),esm,eco,prov_opts.get(epv),ecal,epro,1 if eveg else 0,ing["id"]))
+                Qexec("UPDATE ingredientes SET nombre=%s,tipo=%s,unidad=%s,stock_minimo=%s,costo_unitario=%s,proveedor_id=%s,calorias=%s,proteinas_g=%s,vegetales=%s WHERE id=%s",
+                      (en.strip(),et,eu.strip(),esm,eco,prov_opts.get(epv),ecal,epro,1 if eveg else 0,ing["id"]))
                 st.success("✅ Actualizado."); st.rerun()
             if col2.button("🗑 Eliminar",type="secondary",key="btn_idel"):
-                with get_connection() as conn:
-                    conn.execute("DELETE FROM receta_ingredientes WHERE ingrediente_id=?",(ing["id"],))
-                    conn.execute("DELETE FROM ingredientes WHERE id=?",(ing["id"],))
+                Qexec("DELETE FROM receta_ingredientes WHERE ingrediente_id=%s",(ing["id"],))
+                Qexec("DELETE FROM ingredientes WHERE id=%s",(ing["id"],))
                 st.warning(f"🗑 **{ing['nombre']}** eliminado."); st.rerun()
 
     with tab_stock:
@@ -263,14 +251,13 @@ elif pagina == "📋 Recetas / BOM":
             for r in recetas:
                 bom=get_bom(r["id"])
                 costo=sum(b["cantidad"]*b["costo_unitario"] for b in bom)
-                cal=sum(b["cantidad"]*b["calorias"] for b in bom)
                 prot=sum(b["cantidad"]*b["proteinas_g"] for b in bom)
                 veg=sum(1 for b in bom if b["vegetales"])
                 with st.expander(f"**{r['nombre']}** — {len(bom)} ingredientes | Q {costo:.2f}/porción"):
                     col1,col2,col3=st.columns(3)
                     col1.metric("Costo/porción",f"Q {costo:.2f}")
                     col2.metric("Proteínas",f"{prot:.1f} g")
-                    col3.metric("Ingredientes vegetales",veg)
+                    col3.metric("Vegetales",veg)
                     if bom:
                         df=pd.DataFrame(bom)[["nombre","cantidad","unidad","costo_unitario","proteinas_g","vegetales","proveedor"]]
                         df.columns=["Ingrediente","Cant./porción","Unidad","Costo Q","Proteínas g","Vegetal","Proveedor"]
@@ -284,18 +271,17 @@ elif pagina == "📋 Recetas / BOM":
             ro={r["nombre"]:r for r in recetas}
             sel=st.selectbox("Receta",list(ro.keys()),key="redit_sel"); rec=ro[sel]
             c1,c2=st.columns(2)
-            en=c1.text_input("Nombre",value=rec["nombre"],key="re_n"); ed=c2.text_input("Descripción",value=rec["descripcion"],key="re_d")
+            en=c1.text_input("Nombre",value=rec["nombre"],key="re_n")
+            ed=c2.text_input("Descripción",value=rec["descripcion"],key="re_d")
             col1,col2=st.columns(2)
             if col1.button("💾 Guardar",type="primary",key="btn_rupd"):
-                with get_connection() as conn:
-                    conn.execute("UPDATE recetas SET nombre=?,descripcion=? WHERE id=?",(en.strip(),ed.strip(),rec["id"]))
+                Qexec("UPDATE recetas SET nombre=%s,descripcion=%s WHERE id=%s",(en.strip(),ed.strip(),rec["id"]))
                 st.success("✅ Actualizado."); st.rerun()
             if col2.button("🗑 Eliminar",type="secondary",key="btn_rdel"):
-                with get_connection() as conn:
-                    conn.execute("DELETE FROM receta_ingredientes WHERE receta_id=?",(rec["id"],))
-                    conn.execute("DELETE FROM caja_recetas WHERE receta_id=?",(rec["id"],))
-                    conn.execute("DELETE FROM menu_recetas WHERE receta_id=?",(rec["id"],))
-                    conn.execute("UPDATE recetas SET activa=0 WHERE id=?",(rec["id"],))
+                Qexec("DELETE FROM receta_ingredientes WHERE receta_id=%s",(rec["id"],))
+                Qexec("DELETE FROM caja_recetas WHERE receta_id=%s",(rec["id"],))
+                Qexec("DELETE FROM menu_recetas WHERE receta_id=%s",(rec["id"],))
+                Qexec("UPDATE recetas SET activa=0 WHERE id=%s",(rec["id"],))
                 st.warning(f"🗑 **{rec['nombre']}** eliminada."); st.rerun()
 
     with tab_bom:
@@ -313,12 +299,10 @@ elif pagina == "📋 Recetas / BOM":
                     col1.write(f"**{b['nombre']}** ({b['unidad']}) — {b['proveedor']}")
                     nc=col2.number_input("Cant.",min_value=0.0,step=0.1,value=float(b["cantidad"]),key=f"bc_{b['id']}")
                     if col2.button("💾",key=f"bs_{b['id']}"):
-                        with get_connection() as conn:
-                            conn.execute("UPDATE receta_ingredientes SET cantidad=? WHERE id=?",(nc,b["id"]))
+                        Qexec("UPDATE receta_ingredientes SET cantidad=%s WHERE id=%s",(nc,b["id"]))
                         st.success("✅"); st.rerun()
                     if col3.button("🗑",key=f"bd_{b['id']}"):
-                        with get_connection() as conn:
-                            conn.execute("DELETE FROM receta_ingredientes WHERE id=?",(b["id"],))
+                        Qexec("DELETE FROM receta_ingredientes WHERE id=%s",(b["id"],))
                         st.rerun()
             else: st.info("Sin ingredientes.")
             st.markdown("---")
@@ -337,7 +321,6 @@ elif pagina == "🍽️ Menús":
     tab_ver,tab_nuevo,tab_editar,tab_recetas=st.tabs(["📄 Ver menús","➕ Nuevo menú","✏️ Editar","🔗 Recetas del menú"])
 
     with tab_nuevo:
-        st.caption("Un menú es una combinación de recetas con una categoría y tamaño de ración.")
         c1,c2=st.columns(2)
         mn=c1.text_input("Nombre *",key="mn_n"); md=c2.text_input("Descripción",key="mn_d")
         c3,c4=st.columns(2)
@@ -357,19 +340,17 @@ elif pagina == "🍽️ Menús":
                 recs=get_menu_recetas(m["id"])
                 with st.expander(f"**{m['nombre']}** — {CATS_LBL[m['categoria']]} | 👥 {m['racion']} personas | {len(recs)} recetas"):
                     st.write(f"*{m['descripcion']}*")
-                    if recs:
-                        for r in recs: st.write(f"  • {r['nombre']}")
-                    else: st.warning("Sin recetas asignadas.")
-        else: st.info("Sin menús creados.")
+                    for r in recs: st.write(f"  • {r['nombre']}")
+        else: st.info("Sin menús.")
 
     with tab_editar:
         menus=get_menus()
-        if not menus: st.info("Sin menús.")
-        else:
+        if menus:
             mo={m["nombre"]:m for m in menus}
             sel=st.selectbox("Menú",list(mo.keys()),key="medit_sel"); m=mo[sel]
             c1,c2=st.columns(2)
-            en=c1.text_input("Nombre",value=m["nombre"],key="me_n"); ed=c2.text_input("Descripción",value=m["descripcion"],key="me_d")
+            en=c1.text_input("Nombre",value=m["nombre"],key="me_n")
+            ed=c2.text_input("Descripción",value=m["descripcion"],key="me_d")
             c3,c4=st.columns(2)
             cat_lbls=[CATS_LBL[k] for k in CATS]
             ec=c3.selectbox("Categoría",cat_lbls,index=CATS.index(m["categoria"]),key="me_cat")
@@ -377,15 +358,13 @@ elif pagina == "🍽️ Menús":
             col1,col2=st.columns(2)
             if col1.button("💾 Guardar",type="primary",key="btn_mupd"):
                 cat_key=CATS[cat_lbls.index(ec)]
-                with get_connection() as conn:
-                    conn.execute("UPDATE menus SET nombre=?,descripcion=?,categoria=?,racion=? WHERE id=?",
-                                 (en.strip(),ed.strip(),cat_key,er,m["id"]))
+                Qexec("UPDATE menus SET nombre=%s,descripcion=%s,categoria=%s,racion=%s WHERE id=%s",
+                      (en.strip(),ed.strip(),cat_key,er,m["id"]))
                 st.success("✅ Actualizado."); st.rerun()
             if col2.button("🗑 Eliminar",type="secondary",key="btn_mdel"):
-                with get_connection() as conn:
-                    conn.execute("DELETE FROM menu_recetas WHERE menu_id=?",(m["id"],))
-                    conn.execute("UPDATE menus SET activo=0 WHERE id=?",(m["id"],))
-                st.warning(f"🗑 Menú eliminado."); st.rerun()
+                Qexec("DELETE FROM menu_recetas WHERE menu_id=%s",(m["id"],))
+                Qexec("UPDATE menus SET activo=0 WHERE id=%s",(m["id"],))
+                st.warning("🗑 Menú eliminado."); st.rerun()
 
     with tab_recetas:
         menus=get_menus(); recetas=get_recetas()
@@ -402,8 +381,7 @@ elif pagina == "🍽️ Menús":
                     col1,col2=st.columns([4,1])
                     col1.write(f"• {r['nombre']}")
                     if col2.button("🗑",key=f"dmr_{r['id']}"):
-                        with get_connection() as conn:
-                            conn.execute("DELETE FROM menu_recetas WHERE id=?",(r["id"],))
+                        Qexec("DELETE FROM menu_recetas WHERE id=%s",(r["id"],))
                         st.rerun()
             else: st.info("Sin recetas.")
             st.markdown("---")
@@ -418,7 +396,6 @@ elif pagina == "🍽️ Menús":
 elif pagina == "💰 Costeo de Paquetes":
     st.subheader("💰 Costeo de Paquetes")
     menus=get_menus()
-
     if not menus:
         st.warning("Primero crea menús con recetas asignadas.")
     else:
@@ -430,110 +407,72 @@ elif pagina == "💰 Costeo de Paquetes":
             c1,c2=st.columns(2)
             margen=c1.slider("Margen de ganancia %",10,80,35,key="cost_margen")
             empaque=c2.number_input("Costo de empaque Q",min_value=0.0,step=0.5,value=5.0,key="cost_emp")
-
             if st.button("📊 Calcular costo",type="primary",key="btn_cost"):
                 res=calcular_costo_menu(mo[sel],margen,empaque)
-                if not res:
-                    st.error("No se pudo calcular.")
-                else:
+                if res:
                     m=res["menu"]
                     st.markdown(f"### {m['nombre']} — {CATS_LBL[m['categoria']]} | 👥 {res['racion']} personas")
-
-                    # Métricas principales
                     col1,col2,col3,col4=st.columns(4)
-                    col1.metric("Costo ingredientes", f"Q {res['costo_ingredientes']:.2f}")
-                    col2.metric("Costo empaque",       f"Q {res['costo_empaque']:.2f}")
-                    col3.metric("Costo total",         f"Q {res['costo_total']:.2f}")
-                    col4.metric("💰 Precio sugerido",  f"Q {res['precio_sugerido']:.2f}",
-                                delta=f"+Q {res['ganancia']:.2f} ganancia")
-
+                    col1.metric("Costo ingredientes",f"Q {res['costo_ingredientes']:.2f}")
+                    col2.metric("Costo empaque",f"Q {res['costo_empaque']:.2f}")
+                    col3.metric("Costo total",f"Q {res['costo_total']:.2f}")
+                    col4.metric("💰 Precio sugerido",f"Q {res['precio_sugerido']:.2f}",delta=f"+Q {res['ganancia']:.2f}")
                     col1,col2,col3=st.columns(3)
-                    col1.metric("Costo por persona",   f"Q {res['costo_p_persona']:.2f}")
-                    col2.metric("Precio por persona",  f"Q {res['precio_p_persona']:.2f}")
-                    col3.metric("Margen aplicado",     f"{margen}%")
-
+                    col1.metric("Costo/persona",f"Q {res['costo_p_persona']:.2f}")
+                    col2.metric("Precio/persona",f"Q {res['precio_p_persona']:.2f}")
+                    col3.metric("Margen",f"{margen}%")
                     st.markdown("---")
-
-                    # Perfil nutricional
-                    st.markdown("**🥗 Perfil nutricional del menú completo:**")
+                    st.markdown("**🥗 Perfil nutricional:**")
                     col1,col2,col3=st.columns(3)
-                    col1.metric("🔥 Calorías totales",     f"{res['calorias_total']:.0f} kcal")
-                    col2.metric("💪 Proteínas totales",    f"{res['proteinas_total']:.1f} g")
-                    col3.metric("🥦 Ingredientes vegetales", res['vegetales_total'])
-
+                    col1.metric("🔥 Calorías",f"{res['calorias_total']:.0f} kcal")
+                    col2.metric("💪 Proteínas",f"{res['proteinas_total']:.1f} g")
+                    col3.metric("🥦 Vegetales",res['vegetales_total'])
                     st.markdown("---")
-
-                    # Desglose por receta
                     st.markdown("**📋 Desglose por receta:**")
                     df=pd.DataFrame(res["detalle_recetas"])
                     df.columns=["Receta","Costo Q","Calorías","Proteínas g","Vegetales"]
-                    df["% del costo"]=df["Costo Q"].apply(lambda x: f"{x/res['costo_total']*100:.1f}%")
+                    df["% del costo"]=df["Costo Q"].apply(lambda x:f"{x/res['costo_total']*100:.1f}%")
                     st.dataframe(df,use_container_width=True,hide_index=True)
 
         with tab_comparar:
-            st.markdown("Compara todos los menús según categoría y tamaño de ración.")
             c1,c2,c3=st.columns(3)
-            f_cat=c1.selectbox("Filtrar por categoría",["Todas"]+[CATS_LBL[k] for k in CATS],key="cmp_cat")
-            f_rac=c2.selectbox("Filtrar por ración",["Todas"]+[str(r) for r in RACIONES],key="cmp_rac")
+            f_cat=c1.selectbox("Categoría",["Todas"]+[CATS_LBL[k] for k in CATS],key="cmp_cat")
+            f_rac=c2.selectbox("Ración",["Todas"]+[str(r) for r in RACIONES],key="cmp_rac")
             f_mar=c3.slider("Margen %",10,80,35,key="cmp_mar")
             f_emp=st.number_input("Costo empaque Q",min_value=0.0,step=0.5,value=5.0,key="cmp_emp")
-
             if st.button("🔍 Comparar menús",type="primary",key="btn_cmp"):
                 cat_key=CATS[([CATS_LBL[k] for k in CATS]).index(f_cat)] if f_cat!="Todas" else None
                 rac_key=int(f_rac) if f_rac!="Todas" else None
                 resultados=comparar_menus(cat_key,rac_key,f_mar,f_emp)
-
                 if not resultados:
                     st.warning("Sin menús para los filtros seleccionados.")
                 else:
-                    # Tabla resumen
-                    rows=[]
-                    for r in resultados:
-                        rows.append({
-                            "Menú":              r["menu"]["nombre"],
-                            "Categoría":         CATS_LBL[r["menu"]["categoria"]],
-                            "Ración":            f"{r['racion']} personas",
-                            "Costo total Q":     r["costo_total"],
-                            "Precio sugerido Q": r["precio_sugerido"],
-                            "Ganancia Q":        r["ganancia"],
-                            "Costo/persona Q":   r["costo_p_persona"],
-                            "Precio/persona Q":  r["precio_p_persona"],
-                            "Proteínas g":       r["proteinas_total"],
-                            "Vegetales":         r["vegetales_total"],
-                        })
+                    rows=[{"Menú":r["menu"]["nombre"],"Categoría":CATS_LBL[r["menu"]["categoria"]],
+                           "Ración":f"{r['racion']} personas","Costo total Q":r["costo_total"],
+                           "Precio sugerido Q":r["precio_sugerido"],"Ganancia Q":r["ganancia"],
+                           "Costo/persona Q":r["costo_p_persona"],"Precio/persona Q":r["precio_p_persona"],
+                           "Proteínas g":r["proteinas_total"],"Vegetales":r["vegetales_total"]}
+                          for r in resultados]
                     df=pd.DataFrame(rows)
-
-                    # Destacar más económico, más proteico y más vegetales
                     min_costo=df["Costo total Q"].min()
                     max_prot=df["Proteínas g"].max()
                     max_veg=df["Vegetales"].max()
-
                     def highlight(row):
-                        if row["Costo total Q"]==min_costo:
-                            return ["background-color:#fef9c3"]*len(row)
-                        if row["Proteínas g"]==max_prot:
-                            return ["background-color:#dbeafe"]*len(row)
-                        if row["Vegetales"]==max_veg:
-                            return ["background-color:#dcfce7"]*len(row)
+                        if row["Costo total Q"]==min_costo: return ["background-color:#fef9c3"]*len(row)
+                        if row["Proteínas g"]==max_prot:    return ["background-color:#dbeafe"]*len(row)
+                        if row["Vegetales"]==max_veg:       return ["background-color:#dcfce7"]*len(row)
                         return [""]*len(row)
-
                     st.dataframe(df.style.apply(highlight,axis=1),use_container_width=True,hide_index=True)
-                    st.markdown("""
-                    🟡 **Amarillo** = más económico &nbsp;|&nbsp;
-                    🔵 **Azul** = mayor proteína &nbsp;|&nbsp;
-                    🟢 **Verde** = más vegetales
-                    """)
-
-                    # Recomendaciones automáticas
+                    st.markdown("🟡 **Amarillo** = más económico &nbsp;|&nbsp; 🔵 **Azul** = mayor proteína &nbsp;|&nbsp; 🟢 **Verde** = más vegetales")
                     st.markdown("---")
-                    st.markdown("**🏆 Recomendaciones automáticas:**")
+                    st.markdown("**🏆 Recomendaciones:**")
                     col1,col2,col3=st.columns(3)
-                    mas_eco=min(resultados,key=lambda x:x["costo_total"])
-                    mas_prot=max(resultados,key=lambda x:x["proteinas_total"])
-                    mas_veg=max(resultados,key=lambda x:x["vegetales_total"])
-                    col1.success(f"💰 **Más económico**\n\n{mas_eco['menu']['nombre']}\nQ {mas_eco['costo_total']:.2f}")
-                    col2.info(f"💪 **Mayor proteína**\n\n{mas_prot['menu']['nombre']}\n{mas_prot['proteinas_total']:.1f} g")
-                    col3.success(f"🥦 **Más vegetales**\n\n{mas_veg['menu']['nombre']}\n{mas_veg['vegetales_total']} ingredientes")
+                    eco=min(resultados,key=lambda x:x["costo_total"])
+                    prt=max(resultados,key=lambda x:x["proteinas_total"])
+                    veg=max(resultados,key=lambda x:x["vegetales_total"])
+                    col1.success(f"💰 **Más económico**\n\n{eco['menu']['nombre']}\nQ {eco['costo_total']:.2f}")
+                    col2.info(f"💪 **Mayor proteína**\n\n{prt['menu']['nombre']}\n{prt['proteinas_total']:.1f} g")
+                    col3.success(f"🥦 **Más vegetales**\n\n{veg['menu']['nombre']}\n{veg['vegetales_total']} ingredientes")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CAJAS
@@ -544,7 +483,8 @@ elif pagina == "📦 Cajas":
 
     with tab_nuevo:
         c1,c2,c3=st.columns(3)
-        cn=c1.text_input("Nombre *",key="cj_n"); cd=c2.text_input("Descripción",key="cj_d"); cp=c3.number_input("Precio Q",min_value=0.0,step=5.0,key="cj_p")
+        cn=c1.text_input("Nombre *",key="cj_n"); cd=c2.text_input("Descripción",key="cj_d")
+        cp=c3.number_input("Precio Q",min_value=0.0,step=5.0,key="cj_p")
         if st.button("💾 Crear caja",type="primary",key="btn_cjnew"):
             if not cn.strip(): st.error("Nombre obligatorio.")
             else:
@@ -566,16 +506,16 @@ elif pagina == "📦 Cajas":
             co={c["nombre"]:c for c in cajas}
             sel=st.selectbox("Caja",list(co.keys()),key="cjedit_sel"); caja=co[sel]
             c1,c2,c3=st.columns(3)
-            en=c1.text_input("Nombre",value=caja["nombre"],key="cje_n"); ed=c2.text_input("Descripción",value=caja["descripcion"],key="cje_d"); ep=c3.number_input("Precio Q",min_value=0.0,step=5.0,value=float(caja["precio_venta"]),key="cje_p")
+            en=c1.text_input("Nombre",value=caja["nombre"],key="cje_n")
+            ed=c2.text_input("Descripción",value=caja["descripcion"],key="cje_d")
+            ep=c3.number_input("Precio Q",min_value=0.0,step=5.0,value=float(caja["precio_venta"]),key="cje_p")
             col1,col2=st.columns(2)
             if col1.button("💾 Guardar",type="primary",key="btn_cjupd"):
-                with get_connection() as conn:
-                    conn.execute("UPDATE cajas SET nombre=?,descripcion=?,precio_venta=? WHERE id=?",(en.strip(),ed.strip(),ep,caja["id"]))
+                Qexec("UPDATE cajas SET nombre=%s,descripcion=%s,precio_venta=%s WHERE id=%s",(en.strip(),ed.strip(),ep,caja["id"]))
                 st.success("✅ Actualizado."); st.rerun()
             if col2.button("🗑 Eliminar",type="secondary",key="btn_cjdel"):
-                with get_connection() as conn:
-                    conn.execute("DELETE FROM caja_recetas WHERE caja_id=?",(caja["id"],))
-                    conn.execute("UPDATE cajas SET activa=0 WHERE id=?",(caja["id"],))
+                Qexec("DELETE FROM caja_recetas WHERE caja_id=%s",(caja["id"],))
+                Qexec("UPDATE cajas SET activa=0 WHERE id=%s",(caja["id"],))
                 st.warning(f"🗑 **{caja['nombre']}** eliminada."); st.rerun()
 
     with tab_rec:
@@ -590,8 +530,7 @@ elif pagina == "📦 Cajas":
                 for r in actuales:
                     col1,col2=st.columns([4,1]); col1.write(f"• {r['nombre']}")
                     if col2.button("🗑",key=f"dcr_{r['id']}"):
-                        with get_connection() as conn:
-                            conn.execute("DELETE FROM caja_recetas WHERE id=?",(r["id"],))
+                        Qexec("DELETE FROM caja_recetas WHERE id=%s",(r["id"],))
                         st.rerun()
             else: st.info("Sin recetas.")
             sel_r=st.selectbox("Agregar receta",list(ro.keys()),key="cjrec_rsel")
@@ -611,9 +550,11 @@ elif pagina == "📬 Pedidos":
         if not cajas: st.warning("Primero crea cajas.")
         else:
             c1,c2=st.columns(2)
-            cliente=c1.text_input("Cliente *",key="ped_cli"); fecha_ent=c2.date_input("Fecha entrega",min_value=date.today(),key="ped_fec")
+            cliente=c1.text_input("Cliente *",key="ped_cli")
+            fecha_ent=c2.date_input("Fecha entrega",min_value=date.today(),key="ped_fec")
             co={c["nombre"]:c["id"] for c in cajas}
             if "items_pedido" not in st.session_state: st.session_state.items_pedido=[]
+            st.caption("💡 Las porciones aplican igual para todas las recetas de la caja.")
             c1,c2,c3=st.columns(3)
             sc=c1.selectbox("Caja",list(co.keys()),key="ped_caja")
             cant=c2.number_input("Cantidad",min_value=1,value=1,key="ped_cant")
@@ -651,8 +592,7 @@ elif pagina == "📬 Pedidos":
             sel=st.selectbox("Pedido",list(opts.keys()),key="ped_esel"); ped=opts[sel]
             ne=st.selectbox("Nuevo estado",ESTADOS,index=ESTADOS.index(ped["estado"]),key="ped_enew")
             if st.button("💾 Actualizar",type="primary",key="btn_ped_est"):
-                with get_connection() as conn:
-                    conn.execute("UPDATE pedidos SET estado=? WHERE id=?",(ne,ped["id"]))
+                Qexec("UPDATE pedidos SET estado=%s WHERE id=%s",(ne,ped["id"]))
                 st.success(f"✅ Pedido #{ped['id']} → **{ne}**."); st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -686,7 +626,7 @@ elif pagina == "⚙️ MRP":
             if not ordenes: st.success("✅ Stock suficiente.")
             else:
                 for o in ordenes:
-                    pv=Q("SELECT nombre FROM proveedores WHERE id=?",(o["proveedor_id"],))
+                    pv=Q("SELECT nombre FROM proveedores WHERE id=%s",(o["proveedor_id"],))
                     pn=pv[0]["nombre"] if pv else "Sin proveedor"
                     with st.expander(f"📋 Orden #{o['orden_id']} — {pn} | Q {o['total']:.2f}",expanded=True):
                         st.write(f"**Entrega:** {o['fecha']}")
