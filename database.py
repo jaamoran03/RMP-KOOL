@@ -17,10 +17,10 @@ def get_connection():
     # Extraer project_ref: https://iuhnscliqevkyggeomty.supabase.co → iuhnscliqevkyggeomty
     project_ref = url.replace("https://","").replace("http://","").split(".")[0]
     conn = psycopg2.connect(
-        host="aws-0-us-east-1.pooler.supabase.com",
-        port=6543,
+        host=f"db.{project_ref}.supabase.co",
+        port=5432,
         dbname="postgres",
-        user=f"postgres.{project_ref}",
+        user="postgres",
         password=key,
         sslmode="require",
         cursor_factory=psycopg2.extras.RealDictCursor
