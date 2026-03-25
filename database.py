@@ -1,6 +1,5 @@
 """
-database.py — Conexión a Supabase (PostgreSQL)
-Datos permanentes en la nube, nunca se borran.
+database.py — Conexión a Supabase via Transaction Pooler (psycopg2)
 """
 import os
 import psycopg2
@@ -15,17 +14,17 @@ def get_secrets():
 
 def get_connection():
     url, key = get_secrets()
-    host = url.replace("https://","").replace("http://","").strip("/")
+    # Extraer project_ref: https://iuhnscliqevkyggeomty.supabase.co → iuhnscliqevkyggeomty
+    project_ref = url.replace("https://","").replace("http://","").split(".")[0]
     conn = psycopg2.connect(
-        host=f"db.{host}",
-        port=5432,
+        host="aws-0-us-east-1.pooler.supabase.com",
+        port=6543,
         dbname="postgres",
-        user="postgres",
+        user=f"postgres.{project_ref}",
         password=key,
         sslmode="require",
         cursor_factory=psycopg2.extras.RealDictCursor
     )
-    conn.autocommit = False
     return conn
 
 def init_db():
