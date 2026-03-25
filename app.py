@@ -5,7 +5,7 @@ Base de datos permanente en Supabase (PostgreSQL)
 import streamlit as st
 import pandas as pd
 from datetime import date
-from database import init_db, get_connection
+from database import init_db, get_connection, sync_save
 from mrp_engine import (
     agregar_proveedor, agregar_ingrediente, agregar_receta,
     agregar_ingrediente_receta, agregar_caja, agregar_receta_a_caja,
@@ -19,19 +19,25 @@ init_db()
 
 # ── Helpers DB ────────────────────────────────────────────────────────────────
 def Q(sql, p=()):
-    conn = get_connection()
-    cur  = conn.cursor()
-    cur.execute(sql, p)
-    rows = [dict(r) for r in cur.fetchall()]
-    cur.close(); conn.close()
-    return rows
+    with get_connection() as c:
+        return [dict(r) for r in c.execute(sql, p).fetchall()]
 
 def Qexec(sql, p=()):
-    conn = get_connection()
-    cur  = conn.cursor()
-    cur.execute(sql, p)
-    conn.commit()
-    cur.close(); conn.close()
+    with get_connection() as c:
+        c.execute(sql, p)
+        c.commit()
+    sync_save()
+
+def Qexec_update(tabla, data, filtros):
+    sets = ", ".join(f"{k}=?" for k in data)
+    wheres = " AND ".join(f"{k}=?" for k in filtros)
+    vals = list(data.values()) + list(filtros.values())
+    Qexec(f"UPDATE {tabla} SET {sets} WHERE {wheres}", vals)
+
+def Qexec_delete(tabla, filtros):
+    wheres = " AND ".join(f"{k}=?" for k in filtros)
+    vals = list(filtros.values())
+    Qexec(f"DELETE FROM {tabla} WHERE {wheres}", vals)
 
 def get_proveedores():
     return Q("SELECT id,nombre,contacto,telefono,email,lead_time FROM proveedores WHERE activo=1")
@@ -56,15 +62,15 @@ def get_bom(rid):
                 FROM receta_ingredientes ri
                 JOIN ingredientes i ON i.id=ri.ingrediente_id
                 LEFT JOIN proveedores p ON p.id=i.proveedor_id
-                WHERE ri.receta_id=%s""", (rid,))
+                WHERE ri.receta_id=?""", (rid,))
 
 def get_caja_recetas(cid):
     return Q("""SELECT cr.id,r.id rec_id,r.nombre FROM caja_recetas cr
-                JOIN recetas r ON r.id=cr.receta_id WHERE cr.caja_id=%s""", (cid,))
+                JOIN recetas r ON r.id=cr.receta_id WHERE cr.caja_id=?""", (cid,))
 
 def get_menu_recetas(mid):
     return Q("""SELECT mr.id,r.id rec_id,r.nombre FROM menu_recetas mr
-                JOIN recetas r ON r.id=mr.receta_id WHERE mr.menu_id=%s""", (mid,))
+                JOIN recetas r ON r.id=mr.receta_id WHERE mr.menu_id=?""", (mid,))
 
 def get_pedidos():
     return Q("""SELECT p.id,p.cliente,p.fecha_entrega,p.estado,
@@ -137,11 +143,10 @@ if pagina == "📦 Proveedores":
             el=c5.number_input("Lead time",min_value=1,max_value=60,value=int(pv["lead_time"]),key="pe_l")
             col1,col2=st.columns(2)
             if col1.button("💾 Guardar",type="primary",key="btn_pupd"):
-                Qexec("UPDATE proveedores SET nombre=%s,contacto=%s,telefono=%s,email=%s,lead_time=%s WHERE id=%s",
-                      (en.strip(),ec.strip(),et.strip(),ee.strip(),int(el),pv["id"]))
+                Qexec_update("proveedores",{"nombre":en.strip(),"contacto":ec.strip(),"telefono":et.strip(),"email":ee.strip(),"lead_time":int(el)},{"id":pv["id"]})
                 st.success("✅ Actualizado."); st.rerun()
             if col2.button("🗑 Eliminar",type="secondary",key="btn_pdel"):
-                Qexec("UPDATE proveedores SET activo=0 WHERE id=%s",(pv["id"],))
+                Qexec_update("proveedores",{"activo":0},{"id":pv["id"]})
                 st.warning(f"🗑 **{pv['nombre']}** eliminado."); st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -207,12 +212,11 @@ elif pagina == "🥬 Ingredientes":
             eveg=c3.checkbox("¿Es vegetal?",value=bool(ing["vegetales"]),key="ie_veg")
             col1,col2=st.columns(2)
             if col1.button("💾 Guardar cambios",type="primary",key="btn_iupd"):
-                Qexec("UPDATE ingredientes SET nombre=%s,tipo=%s,unidad=%s,stock_minimo=%s,costo_unitario=%s,proveedor_id=%s,calorias=%s,proteinas_g=%s,vegetales=%s WHERE id=%s",
-                      (en.strip(),et,eu.strip(),esm,eco,prov_opts.get(epv),ecal,epro,1 if eveg else 0,ing["id"]))
+                Qexec_update("ingredientes",{"nombre":en.strip(),"tipo":et,"unidad":eu.strip(),"stock_minimo":esm,"costo_unitario":eco,"proveedor_id":prov_opts.get(epv),"calorias":ecal,"proteinas_g":epro,"vegetales":1 if eveg else 0},{"id":ing["id"]})
                 st.success("✅ Actualizado."); st.rerun()
             if col2.button("🗑 Eliminar",type="secondary",key="btn_idel"):
-                Qexec("DELETE FROM receta_ingredientes WHERE ingrediente_id=%s",(ing["id"],))
-                Qexec("DELETE FROM ingredientes WHERE id=%s",(ing["id"],))
+                Qexec_delete("receta_ingredientes",{"ingrediente_id":ing["id"]})
+                Qexec_delete("ingredientes",{"id":ing["id"]})
                 st.warning(f"🗑 **{ing['nombre']}** eliminado."); st.rerun()
 
     with tab_stock:
@@ -275,13 +279,13 @@ elif pagina == "📋 Recetas / BOM":
             ed=c2.text_input("Descripción",value=rec["descripcion"],key="re_d")
             col1,col2=st.columns(2)
             if col1.button("💾 Guardar",type="primary",key="btn_rupd"):
-                Qexec("UPDATE recetas SET nombre=%s,descripcion=%s WHERE id=%s",(en.strip(),ed.strip(),rec["id"]))
+                Qexec_update("recetas",{"nombre":en.strip(),"descripcion":ed.strip()},{"id":rec["id"]})
                 st.success("✅ Actualizado."); st.rerun()
             if col2.button("🗑 Eliminar",type="secondary",key="btn_rdel"):
-                Qexec("DELETE FROM receta_ingredientes WHERE receta_id=%s",(rec["id"],))
-                Qexec("DELETE FROM caja_recetas WHERE receta_id=%s",(rec["id"],))
-                Qexec("DELETE FROM menu_recetas WHERE receta_id=%s",(rec["id"],))
-                Qexec("UPDATE recetas SET activa=0 WHERE id=%s",(rec["id"],))
+                Qexec_delete("receta_ingredientes",{"receta_id":rec["id"]})
+                Qexec_delete("caja_recetas",{"receta_id":rec["id"]})
+                Qexec_delete("menu_recetas",{"receta_id":rec["id"]})
+                Qexec_update("recetas",{"activa":0},{"id":rec["id"]})
                 st.warning(f"🗑 **{rec['nombre']}** eliminada."); st.rerun()
 
     with tab_bom:
@@ -299,10 +303,10 @@ elif pagina == "📋 Recetas / BOM":
                     col1.write(f"**{b['nombre']}** ({b['unidad']}) — {b['proveedor']}")
                     nc=col2.number_input("Cant.",min_value=0.0,step=0.1,value=float(b["cantidad"]),key=f"bc_{b['id']}")
                     if col2.button("💾",key=f"bs_{b['id']}"):
-                        Qexec("UPDATE receta_ingredientes SET cantidad=%s WHERE id=%s",(nc,b["id"]))
+                        Qexec_update("receta_ingredientes",{"cantidad":nc},{"id":b["id"]})
                         st.success("✅"); st.rerun()
                     if col3.button("🗑",key=f"bd_{b['id']}"):
-                        Qexec("DELETE FROM receta_ingredientes WHERE id=%s",(b["id"],))
+                        Qexec_delete("receta_ingredientes",{"id":b["id"]})
                         st.rerun()
             else: st.info("Sin ingredientes.")
             st.markdown("---")
@@ -358,12 +362,11 @@ elif pagina == "🍽️ Menús":
             col1,col2=st.columns(2)
             if col1.button("💾 Guardar",type="primary",key="btn_mupd"):
                 cat_key=CATS[cat_lbls.index(ec)]
-                Qexec("UPDATE menus SET nombre=%s,descripcion=%s,categoria=%s,racion=%s WHERE id=%s",
-                      (en.strip(),ed.strip(),cat_key,er,m["id"]))
+                Qexec_update("menus",{"nombre":en.strip(),"descripcion":ed.strip(),"categoria":cat_key,"racion":er},{"id":m["id"]})
                 st.success("✅ Actualizado."); st.rerun()
             if col2.button("🗑 Eliminar",type="secondary",key="btn_mdel"):
-                Qexec("DELETE FROM menu_recetas WHERE menu_id=%s",(m["id"],))
-                Qexec("UPDATE menus SET activo=0 WHERE id=%s",(m["id"],))
+                Qexec_delete("menu_recetas",{"menu_id":m["id"]})
+                Qexec_update("menus",{"activo":0},{"id":m["id"]})
                 st.warning("🗑 Menú eliminado."); st.rerun()
 
     with tab_recetas:
@@ -381,7 +384,7 @@ elif pagina == "🍽️ Menús":
                     col1,col2=st.columns([4,1])
                     col1.write(f"• {r['nombre']}")
                     if col2.button("🗑",key=f"dmr_{r['id']}"):
-                        Qexec("DELETE FROM menu_recetas WHERE id=%s",(r["id"],))
+                        Qexec_delete("menu_recetas",{"id":r["id"]})
                         st.rerun()
             else: st.info("Sin recetas.")
             st.markdown("---")
@@ -511,11 +514,11 @@ elif pagina == "📦 Cajas":
             ep=c3.number_input("Precio Q",min_value=0.0,step=5.0,value=float(caja["precio_venta"]),key="cje_p")
             col1,col2=st.columns(2)
             if col1.button("💾 Guardar",type="primary",key="btn_cjupd"):
-                Qexec("UPDATE cajas SET nombre=%s,descripcion=%s,precio_venta=%s WHERE id=%s",(en.strip(),ed.strip(),ep,caja["id"]))
+                Qexec_update("cajas",{"nombre":en.strip(),"descripcion":ed.strip(),"precio_venta":ep},{"id":caja["id"]})
                 st.success("✅ Actualizado."); st.rerun()
             if col2.button("🗑 Eliminar",type="secondary",key="btn_cjdel"):
-                Qexec("DELETE FROM caja_recetas WHERE caja_id=%s",(caja["id"],))
-                Qexec("UPDATE cajas SET activa=0 WHERE id=%s",(caja["id"],))
+                Qexec_delete("caja_recetas",{"caja_id":caja["id"]})
+                Qexec_update("cajas",{"activa":0},{"id":caja["id"]})
                 st.warning(f"🗑 **{caja['nombre']}** eliminada."); st.rerun()
 
     with tab_rec:
@@ -530,7 +533,7 @@ elif pagina == "📦 Cajas":
                 for r in actuales:
                     col1,col2=st.columns([4,1]); col1.write(f"• {r['nombre']}")
                     if col2.button("🗑",key=f"dcr_{r['id']}"):
-                        Qexec("DELETE FROM caja_recetas WHERE id=%s",(r["id"],))
+                        Qexec_delete("caja_recetas",{"id":r["id"]})
                         st.rerun()
             else: st.info("Sin recetas.")
             sel_r=st.selectbox("Agregar receta",list(ro.keys()),key="cjrec_rsel")
@@ -592,7 +595,7 @@ elif pagina == "📬 Pedidos":
             sel=st.selectbox("Pedido",list(opts.keys()),key="ped_esel"); ped=opts[sel]
             ne=st.selectbox("Nuevo estado",ESTADOS,index=ESTADOS.index(ped["estado"]),key="ped_enew")
             if st.button("💾 Actualizar",type="primary",key="btn_ped_est"):
-                Qexec("UPDATE pedidos SET estado=%s WHERE id=%s",(ne,ped["id"]))
+                Qexec_update("pedidos",{"estado":ne},{"id":ped["id"]})
                 st.success(f"✅ Pedido #{ped['id']} → **{ne}**."); st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -626,7 +629,7 @@ elif pagina == "⚙️ MRP":
             if not ordenes: st.success("✅ Stock suficiente.")
             else:
                 for o in ordenes:
-                    pv=Q("SELECT nombre FROM proveedores WHERE id=%s",(o["proveedor_id"],))
+                    pv=Q("SELECT nombre FROM proveedores WHERE id=?",(o["proveedor_id"],))
                     pn=pv[0]["nombre"] if pv else "Sin proveedor"
                     with st.expander(f"📋 Orden #{o['orden_id']} — {pn} | Q {o['total']:.2f}",expanded=True):
                         st.write(f"**Entrega:** {o['fecha']}")
